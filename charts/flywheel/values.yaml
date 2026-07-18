@@ -7,8 +7,8 @@ commonLabels: {}
 commonAnnotations: {}
 
 image:
-  repository: ghcr.io/ctxswitch/flywheel
-  # Defaults to Chart.appVersion when empty. digest takes precedence over tag.
+  repository: ctxsh/flywheel
+  # Defaults to v<Chart.appVersion> when empty. digest takes precedence over tag.
   tag: ""
   digest: ""
   pullPolicy: IfNotPresent

@@ -912,7 +912,7 @@ spec:
   automountServiceAccountToken: false
   initContainers:
     - name: flywheel-agent
-      image: ghcr.io/ctxswitch/flywheel@sha256:<image-digest>
+      image: ctxsh/flywheel@sha256:<image-digest>
       args: ["agent"]
       restartPolicy: Always
       env:
