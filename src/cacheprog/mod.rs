@@ -169,7 +169,9 @@ where
     let mut in_flight = FuturesUnordered::new();
     let mut close_id = None;
     loop {
-        if close_id.is_some() && in_flight.is_empty() {
+        if let Some(id) = close_id
+            && in_flight.is_empty()
+        {
             finish_session(
                 &mut prefetch_task,
                 &client,
@@ -182,7 +184,7 @@ where
             write_response(
                 &mut writer,
                 &Response {
-                    id: close_id.expect("close ID was checked"),
+                    id,
                     ..Response::default()
                 },
             )
