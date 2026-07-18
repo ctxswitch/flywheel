@@ -1,0 +1,241 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "flywheel.fullname" . }}
+  labels:
+    {{- include "flywheel.shardLabels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.shards.replicas }}
+  serviceName: {{ include "flywheel.shardsServiceName" . }}
+  podManagementPolicy: {{ .Values.shards.podManagementPolicy }}
+  minReadySeconds: {{ .Values.shards.minReadySeconds }}
+  revisionHistoryLimit: {{ .Values.shards.revisionHistoryLimit }}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: {{ .Values.shards.storage.retentionPolicy.whenDeleted }}
+    whenScaled: {{ .Values.shards.storage.retentionPolicy.whenScaled }}
+  updateStrategy:
+    type: {{ .Values.shards.updateStrategy.type }}
+    {{- if and (eq .Values.shards.updateStrategy.type "RollingUpdate") (ne .Values.shards.updateStrategy.rollingUpdate.partition nil) }}
+    rollingUpdate:
+      partition: {{ .Values.shards.updateStrategy.rollingUpdate.partition }}
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "flywheel.shardSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "flywheel.shardPodLabels" . | nindent 8 }}
+      {{- with (mergeOverwrite (dict) .Values.commonAnnotations .Values.shards.podAnnotations) }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "flywheel.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.shards.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.shards.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.shards.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.shards.runtimeClassName }}
+      runtimeClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.shards.schedulerName }}
+      schedulerName: {{ . | quote }}
+      {{- end }}
+      containers:
+        - name: flywheel
+          image: {{ include "flywheel.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.shards.config.logFilter | quote }}
+            - name: FLYWHEEL_LISTEN
+              value: {{ printf "0.0.0.0:%v" .Values.shards.port | quote }}
+            - name: FLYWHEEL_DATA_DIR
+              value: {{ .Values.shards.dataDir | quote }}
+            - name: FLYWHEEL_MAX_UPLOAD_BYTES
+              value: {{ .Values.shards.config.maxUploadBytes | quote }}
+            - name: FLYWHEEL_DEFAULT_EXPIRY_SECONDS
+              value: {{ .Values.shards.config.defaultExpirySeconds | quote }}
+            - name: FLYWHEEL_FOREGROUND_CONCURRENCY
+              value: {{ .Values.shards.config.foregroundConcurrency | quote }}
+            - name: FLYWHEEL_RESERVATION_EXTENT_BYTES
+              value: {{ .Values.shards.config.reservationExtentBytes | quote }}
+            - name: FLYWHEEL_LOW_WATERMARK_BYTES
+              value: {{ .Values.shards.config.lowWatermarkBytes | quote }}
+            - name: FLYWHEEL_HIGH_WATERMARK_BYTES
+              value: {{ .Values.shards.config.highWatermarkBytes | quote }}
+            - name: FLYWHEEL_EMERGENCY_HEADROOM_BYTES
+              value: {{ .Values.shards.config.emergencyHeadroomBytes | quote }}
+            - name: FLYWHEEL_BLOOM_BITS
+              value: {{ .Values.shards.config.bloomBits | quote }}
+            - name: FLYWHEEL_RECLAIM_CANDIDATE_LIMIT
+              value: {{ .Values.shards.config.reclaimCandidateLimit | quote }}
+            - name: FLYWHEEL_RECLAIM_BYTE_LIMIT
+              value: {{ .Values.shards.config.reclaimByteLimit | quote }}
+            - name: FLYWHEEL_ORPHAN_SCAN_LIMIT
+              value: {{ .Values.shards.config.orphanScanLimit | quote }}
+            - name: FLYWHEEL_GO_UPSTREAM
+              value: {{ .Values.shards.config.goUpstream | quote }}
+            - name: FLYWHEEL_PYTHON_UPSTREAM
+              value: {{ .Values.shards.config.pythonUpstream | quote }}
+            - name: FLYWHEEL_NPM_UPSTREAM
+              value: {{ .Values.shards.config.npmUpstream | quote }}
+            - name: FLYWHEEL_CARGO_INDEX_UPSTREAM
+              value: {{ .Values.shards.config.cargoIndexUpstream | quote }}
+            - name: FLYWHEEL_CARGO_CRATE_UPSTREAM
+              value: {{ .Values.shards.config.cargoCrateUpstream | quote }}
+            - name: FLYWHEEL_PROXY_REVALIDATION_SECONDS
+              value: {{ .Values.shards.config.proxyRevalidationSeconds | quote }}
+            - name: FLYWHEEL_PROXY_CONCURRENCY
+              value: {{ .Values.shards.config.proxyConcurrency | quote }}
+            - name: FLYWHEEL_UPSTREAM_TIMEOUT_SECONDS
+              value: {{ .Values.shards.config.upstreamTimeoutSeconds | quote }}
+            {{- with .Values.shards.config.proxyAllowedOrigins }}
+            - name: FLYWHEEL_PROXY_ALLOWED_ORIGINS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.shards.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.shards.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: flywheel
+              containerPort: {{ .Values.shards.port }}
+              protocol: TCP
+          {{- if .Values.shards.startupProbe.enabled }}
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: flywheel
+            periodSeconds: {{ .Values.shards.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.shards.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.shards.startupProbe.failureThreshold }}
+            successThreshold: {{ .Values.shards.startupProbe.successThreshold }}
+          {{- end }}
+          {{- if .Values.shards.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: flywheel
+            periodSeconds: {{ .Values.shards.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.shards.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.shards.readinessProbe.failureThreshold }}
+            successThreshold: {{ .Values.shards.readinessProbe.successThreshold }}
+          {{- end }}
+          {{- if .Values.shards.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: flywheel
+            periodSeconds: {{ .Values.shards.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.shards.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.shards.livenessProbe.failureThreshold }}
+            successThreshold: {{ .Values.shards.livenessProbe.successThreshold }}
+          {{- end }}
+          {{- with .Values.shards.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.shards.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.shards.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.shards.dataDir | quote }}
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.shards.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          {{- if .Values.shards.tmpDir.sizeLimit }}
+          emptyDir:
+            sizeLimit: {{ .Values.shards.tmpDir.sizeLimit | quote }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if not .Values.shards.storage.enabled }}
+        - name: data
+          {{- if .Values.shards.emptyDir.sizeLimit }}
+          emptyDir:
+            sizeLimit: {{ .Values.shards.emptyDir.sizeLimit | quote }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        {{- with .Values.shards.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if .Values.shards.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.shards.topologySpread.maxSkew }}
+          topologyKey: {{ .Values.shards.topologySpread.topologyKey | quote }}
+          whenUnsatisfiable: {{ .Values.shards.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "flywheel.shardSelector" . | nindent 14 }}
+      {{- end }}
+      {{- with .Values.shards.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.shards.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.shards.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.shards.storage.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- $labels := include "flywheel.shardLabels" . | fromYaml }}
+          {{- toYaml (merge $labels .Values.shards.storage.labels) | nindent 10 }}
+        {{- with (mergeOverwrite (dict) .Values.commonAnnotations .Values.shards.storage.annotations) }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.shards.storage.accessModes | nindent 10 }}
+        volumeMode: {{ .Values.shards.storage.volumeMode }}
+        {{- if eq .Values.shards.storage.className "-" }}
+        storageClassName: ""
+        {{- else if .Values.shards.storage.className }}
+        storageClassName: {{ .Values.shards.storage.className | quote }}
+        {{- end }}
+        {{- with .Values.shards.storage.selector }}
+        selector:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.shards.storage.size | quote }}
+  {{- end }}

@@ -1,0 +1,34 @@
+# Rust build artifacts
+/target/
+
+# IDEs and editors
+/.idea/
+/.vscode/
+/.fleet/
+/.zed/
+/.settings/
+*.iml
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+
+# Local LLM tool state
+/.agents/
+/.aider*
+/.claude/
+/.codex/
+/.continue/
+/.cursor/
+/.gemini/
+/.llm/
+/.windsurf/
+/.cursorrules
+/.windsurfrules
+AGENTS.local.md
+CLAUDE.local.md
+GEMINI.local.md

@@ -1,0 +1,17 @@
+apiVersion: v2
+name: flywheel
+description: >-
+  Production deployment for Flywheel cache shards and the optional hash-ring
+  routing tier.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.32.0-0"
+home: https://github.com/ctxswitch/flywheel
+sources:
+  - https://github.com/ctxswitch/flywheel
+keywords:
+  - cache
+  - build-cache
+  - package-proxy
+  - artifact-cache

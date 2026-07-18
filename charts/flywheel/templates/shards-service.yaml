@@ -1,0 +1,31 @@
+# Headless discovery Service. Only ready shard Pods are published, and the
+# named port produces one SRV record per ready StatefulSet identity.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flywheel.shardsServiceName" . }}
+  labels:
+    {{- $labels := include "flywheel.shardLabels" . | fromYaml }}
+    {{- toYaml (merge $labels .Values.shards.service.labels) | nindent 4 }}
+  {{- with (mergeOverwrite (dict) .Values.commonAnnotations .Values.shards.service.annotations) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  {{- with .Values.shards.service.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ . }}
+  {{- end }}
+  {{- with .Values.shards.service.ipFamilies }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    {{- include "flywheel.shardSelector" . | nindent 4 }}
+  ports:
+    - name: flywheel
+      protocol: TCP
+      appProtocol: http
+      port: {{ .Values.shards.port }}
+      targetPort: flywheel

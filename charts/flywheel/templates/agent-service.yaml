@@ -1,0 +1,50 @@
+{{- if and .Values.agent.enabled .Values.service.enabled }}
+# Shared client entry point. Its selector cannot match shard Pods, so forwarding
+# always reaches a direct address from the headless discovery Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flywheel.fullname" . }}
+  labels:
+    {{- $labels := include "flywheel.agentLabels" . | fromYaml }}
+    {{- toYaml (merge $labels .Values.service.labels) | nindent 4 }}
+  {{- with (mergeOverwrite (dict) .Values.commonAnnotations .Values.service.annotations) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- with .Values.service.clusterIP }}
+  clusterIP: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  sessionAffinity: {{ .Values.service.sessionAffinity }}
+  {{- with .Values.service.sessionAffinityConfig }}
+  sessionAffinityConfig:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ . }}
+  {{- end }}
+  {{- with .Values.service.ipFamilies }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    {{- include "flywheel.agentSelector" . | nindent 4 }}
+  ports:
+    - name: http
+      protocol: TCP
+      appProtocol: http
+      port: {{ .Values.service.port }}
+      targetPort: agent
+{{- end }}

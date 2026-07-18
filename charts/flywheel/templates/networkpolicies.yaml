@@ -1,0 +1,54 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "flywheel.shardsServiceName" . }}
+  labels:
+    {{- include "flywheel.shardLabels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "flywheel.shardSelector" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        {{- if .Values.agent.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "flywheel.agentSelector" . | nindent 14 }}
+        {{- end }}
+        {{- with .Values.networkPolicy.shards.additionalIngress }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- if .Values.agent.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "flywheel.agentName" . }}
+  labels:
+    {{- include "flywheel.agentLabels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "flywheel.agentSelector" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.networkPolicy.agent.ingress }}
+    - from:
+        {{- toYaml .Values.networkPolicy.agent.ingress | nindent 8 }}
+    {{- else }}
+    - {}
+    {{- end }}
+{{- end }}
+{{- end }}

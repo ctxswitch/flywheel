@@ -1,0 +1,310 @@
+# Override generated resource names.
+nameOverride: ""
+fullnameOverride: ""
+
+# Added to every resource without becoming part of immutable selectors.
+commonLabels: {}
+commonAnnotations: {}
+
+image:
+  repository: ghcr.io/ctxswitch/flywheel
+  # Defaults to Chart.appVersion when empty. digest takes precedence over tag.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Used when constructing the shard Service's fully qualified DNS SRV name.
+clusterDomain: cluster.local
+
+# Flywheel discovers shards through DNS and does not call the Kubernetes API.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+shards:
+  replicas: 3
+  port: 8080
+  dataDir: /var/lib/flywheel
+
+  # Complete `flywheel serve` configuration. Byte counts are raw bytes and time
+  # values are seconds.
+  config:
+    logFilter: info
+    maxUploadBytes: "10737418240"
+    defaultExpirySeconds: "604800"
+    foregroundConcurrency: "256"
+    reservationExtentBytes: "67108864"
+    lowWatermarkBytes: "2147483648"
+    highWatermarkBytes: "8589934592"
+    emergencyHeadroomBytes: "1073741824"
+    bloomBits: "1048576"
+    reclaimCandidateLimit: "256"
+    reclaimByteLimit: "8589934592"
+    orphanScanLimit: "4096"
+    goUpstream: https://proxy.golang.org/
+    pythonUpstream: https://pypi.org/simple/
+    npmUpstream: https://registry.npmjs.org/
+    cargoIndexUpstream: https://index.crates.io/
+    cargoCrateUpstream: https://static.crates.io/crates/
+    proxyRevalidationSeconds: "300"
+    proxyConcurrency: "64"
+    upstreamTimeoutSeconds: "30"
+    proxyAllowedOrigins: []
+
+  service:
+    annotations: {}
+    labels: {}
+    ipFamilyPolicy: ""
+    ipFamilies: []
+
+  storage:
+    enabled: true
+    size: 100Gi
+    # Empty uses the cluster default StorageClass. Use "-" for no class.
+    className: ""
+    accessModes:
+      - ReadWriteOncePod
+    volumeMode: Filesystem
+    annotations: {}
+    labels: {}
+    selector: {}
+    retentionPolicy:
+      whenDeleted: Retain
+      whenScaled: Retain
+  # Used only when storage.enabled is false.
+  emptyDir:
+    sizeLimit: ""
+
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: null
+  minReadySeconds: 10
+  revisionHistoryLimit: 10
+  terminationGracePeriodSeconds: 120
+
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 4Gi
+
+  startupProbe:
+    enabled: true
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 60
+    successThreshold: 1
+  readinessProbe:
+    enabled: true
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    successThreshold: 1
+  livenessProbe:
+    enabled: true
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+    successThreshold: 1
+
+  lifecycle: {}
+  tmpDir:
+    sizeLimit: 256Mi
+
+  topologySpread:
+    enabled: true
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+  affinity: {}
+  nodeSelector: {}
+  tolerations: []
+  priorityClassName: ""
+  runtimeClassName: ""
+  schedulerName: ""
+
+  # extraEnv is appended after chart-managed environment variables. Do not
+  # duplicate a managed name; use shards.config instead.
+  extraEnv: []
+  extraEnvFrom: []
+  extraVolumes: []
+  extraVolumeMounts: []
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: null
+    maxUnavailable: 1
+
+agent:
+  # Disable this Deployment in sidecar-only installations. The headless shard
+  # Service remains available for pod-local agents.
+  enabled: true
+  replicas: 2
+  port: 9080
+  refreshMax: "30"
+  failureLimit: "1"
+  retryTimeout: "30"
+  connectTimeout: "5"
+  deadline: "60"
+  logFilter: info
+
+  minReadySeconds: 5
+  revisionHistoryLimit: 10
+  terminationGracePeriodSeconds: 30
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+  startupProbe:
+    enabled: true
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 30
+    successThreshold: 1
+  readinessProbe:
+    enabled: true
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    successThreshold: 1
+  livenessProbe:
+    enabled: true
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+    successThreshold: 1
+
+  lifecycle: {}
+  tmpDir:
+    sizeLimit: 64Mi
+
+  topologySpread:
+    enabled: true
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+  affinity: {}
+  nodeSelector: {}
+  tolerations: []
+  priorityClassName: ""
+  runtimeClassName: ""
+  schedulerName: ""
+
+  extraEnv: []
+  extraEnvFrom: []
+  extraVolumes: []
+  extraVolumeMounts: []
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: null
+    maxUnavailable: 1
+
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: null
+    behavior: {}
+
+# Client-facing Service for the shared agent Deployment. It never selects shard
+# Pods, because direct shard access bypasses consistent placement.
+service:
+  enabled: true
+  type: ClusterIP
+  port: 80
+  annotations: {}
+  labels: {}
+  clusterIP: ""
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+  sessionAffinity: None
+  sessionAffinityConfig: {}
+  ipFamilyPolicy: ""
+  ipFamilies: []
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  labels: {}
+  hosts:
+    - host: flywheel.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Optional ingress-only policies. Egress remains unrestricted because shards
+# need DNS and configurable public package upstreams.
+networkPolicy:
+  enabled: false
+  # Additional sources allowed to call shards directly. Use this for pod-local
+  # agents, which are not selected by the chart's agent labels.
+  shards:
+    additionalIngress: []
+  # Empty means all sources may call the shared agent Service.
+  agent:
+    ingress: []
+
+monitoring:
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    labels: {}
+    annotations: {}
+    interval: 30s
+    scrapeTimeout: 10s
+    honorLabels: false
+    metricRelabelings: []
+    relabelings: []

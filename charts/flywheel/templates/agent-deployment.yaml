@@ -1,0 +1,165 @@
+{{- if .Values.agent.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "flywheel.agentName" . }}
+  labels:
+    {{- include "flywheel.agentLabels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.agent.autoscaling.enabled }}
+  replicas: {{ .Values.agent.replicas }}
+  {{- end }}
+  minReadySeconds: {{ .Values.agent.minReadySeconds }}
+  revisionHistoryLimit: {{ .Values.agent.revisionHistoryLimit }}
+  strategy:
+    {{- toYaml .Values.agent.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "flywheel.agentSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "flywheel.agentPodLabels" . | nindent 8 }}
+      {{- with (mergeOverwrite (dict) .Values.commonAnnotations .Values.agent.podAnnotations) }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "flywheel.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.agent.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.agent.runtimeClassName }}
+      runtimeClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.agent.schedulerName }}
+      schedulerName: {{ . | quote }}
+      {{- end }}
+      containers:
+        - name: agent
+          image: {{ include "flywheel.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - agent
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.agent.logFilter | quote }}
+            - name: FLYWHEEL_AGENT_LISTEN
+              value: {{ printf "0.0.0.0:%v" .Values.agent.port | quote }}
+            - name: FLYWHEEL_AGENT_SRV
+              value: {{ include "flywheel.srvName" . | quote }}
+            - name: FLYWHEEL_AGENT_REFRESH_MAX
+              value: {{ .Values.agent.refreshMax | quote }}
+            - name: FLYWHEEL_AGENT_FAILURE_LIMIT
+              value: {{ .Values.agent.failureLimit | quote }}
+            - name: FLYWHEEL_AGENT_RETRY_TIMEOUT
+              value: {{ .Values.agent.retryTimeout | quote }}
+            - name: FLYWHEEL_AGENT_CONNECT_TIMEOUT
+              value: {{ .Values.agent.connectTimeout | quote }}
+            - name: FLYWHEEL_AGENT_DEADLINE
+              value: {{ .Values.agent.deadline | quote }}
+            {{- with .Values.agent.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.agent.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: agent
+              containerPort: {{ .Values.agent.port }}
+              protocol: TCP
+          {{- if .Values.agent.startupProbe.enabled }}
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: agent
+            periodSeconds: {{ .Values.agent.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.agent.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.agent.startupProbe.failureThreshold }}
+            successThreshold: {{ .Values.agent.startupProbe.successThreshold }}
+          {{- end }}
+          {{- if .Values.agent.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: agent
+            periodSeconds: {{ .Values.agent.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.agent.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.agent.readinessProbe.failureThreshold }}
+            successThreshold: {{ .Values.agent.readinessProbe.successThreshold }}
+          {{- end }}
+          {{- if .Values.agent.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: agent
+            periodSeconds: {{ .Values.agent.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.agent.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.agent.livenessProbe.failureThreshold }}
+            successThreshold: {{ .Values.agent.livenessProbe.successThreshold }}
+          {{- end }}
+          {{- with .Values.agent.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.agent.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.agent.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          {{- if .Values.agent.tmpDir.sizeLimit }}
+          emptyDir:
+            sizeLimit: {{ .Values.agent.tmpDir.sizeLimit | quote }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- with .Values.agent.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if .Values.agent.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.agent.topologySpread.maxSkew }}
+          topologyKey: {{ .Values.agent.topologySpread.topologyKey | quote }}
+          whenUnsatisfiable: {{ .Values.agent.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "flywheel.agentSelector" . | nindent 14 }}
+      {{- end }}
+      {{- with .Values.agent.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

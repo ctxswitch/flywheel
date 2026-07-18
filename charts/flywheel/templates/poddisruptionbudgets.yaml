@@ -1,0 +1,43 @@
+{{- if .Values.shards.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "flywheel.shardPdbName" . }}
+  labels:
+    {{- include "flywheel.shardLabels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if ne .Values.shards.podDisruptionBudget.minAvailable nil }}
+  minAvailable: {{ .Values.shards.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.shards.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "flywheel.shardSelector" . | nindent 6 }}
+{{- end }}
+{{- if and .Values.agent.enabled .Values.agent.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "flywheel.agentPdbName" . }}
+  labels:
+    {{- include "flywheel.agentLabels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if ne .Values.agent.podDisruptionBudget.minAvailable nil }}
+  minAvailable: {{ .Values.agent.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.agent.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "flywheel.agentSelector" . | nindent 6 }}
+{{- end }}

@@ -1,0 +1,30 @@
+Flywheel shards are discovering through:
+
+  {{ include "flywheel.srvName" . }}
+
+{{- if and .Values.agent.enabled .Values.service.enabled }}
+The shared agent endpoint inside this Kubernetes namespace is:
+
+  http://{{ include "flywheel.fullname" . }}:{{ .Values.service.port }}
+
+Configure Go's cache helper with:
+
+  GOCACHEPROG='flywheel cacheprog --url http://{{ include "flywheel.fullname" . }}:{{ .Values.service.port }}/build-cache/http/'
+{{- else }}
+The shared agent Deployment and Service are disabled. Add `flywheel agent` to each
+client Pod with:
+
+  FLYWHEEL_AGENT_LISTEN=127.0.0.1:{{ .Values.agent.port }}
+  FLYWHEEL_AGENT_SRV={{ include "flywheel.srvName" . }}
+
+Then direct bare cache traffic to http://127.0.0.1:{{ .Values.agent.port }}.
+{{- end }}
+
+Operational constraints:
+
+  * Agent traffic supports only bare routes in the open Default Channel.
+  * Each shard owns independent local data; the chart does not replicate it.
+  * Scaling or replacing shards remaps keys and temporarily lowers hit rate.
+  * PodDisruptionBudgets limit voluntary concurrency but do not make cache data durable.
+
+See docs/operations.md and charts/flywheel/README.md before production rollout.
