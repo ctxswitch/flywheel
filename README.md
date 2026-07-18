@@ -175,6 +175,9 @@ make release
 `make ci` checks formatting, runs Clippy with warnings denied, and executes the test suite.
 Pull requests and pushes to `main` run the same gates in GitHub Actions.
 
+See [BUILDING.md](BUILDING.md) for platform prerequisites and troubleshooting. Contributions are
+welcome under the process in [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Documentation
 
 | Document | Contents |
@@ -184,3 +187,11 @@ Pull requests and pushes to `main` run the same gates in GitHub Actions.
 | [Helm chart](charts/flywheel/README.md) | Storage, scheduling, security, networking, monitoring, and values |
 | [Domain language](CONTEXT.md) | Channel terminology and invariants |
 | [Recency-aware eviction ADR](docs/adr/0001-keep-recency-aware-eviction.md) | Retention and eviction decision record |
+
+## Community and license
+
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). Use
+[SUPPORT.md](SUPPORT.md) for support and issue-reporting guidance and [SECURITY.md](SECURITY.md)
+for private vulnerability reporting.
+
+Flywheel is licensed under the [Apache License 2.0](LICENSE).
