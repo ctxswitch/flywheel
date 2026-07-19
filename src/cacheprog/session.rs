@@ -11,7 +11,8 @@
 
 use crate::manifest::{
     MANIFEST_MAX_AGE_SECONDS, MANIFEST_MAX_ENTRIES, MANIFEST_VERSION, Manifest, ManifestEntry,
-    REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH,
+    REQUEST_PREFETCH_CONCURRENCY_HEADER, REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH,
+    REQUEST_SESSION_HEADER,
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use sha2::{Digest as _, Sha256};
@@ -266,6 +267,7 @@ async fn prefetch(
     let response = client
         .get(status_url)
         .query(&[("session", label)])
+        .header(REQUEST_PREFETCH_CONCURRENCY_HEADER, concurrency)
         .send()
         .await?;
     anyhow::ensure!(
@@ -304,6 +306,8 @@ async fn prefetch(
     let limit = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
     let active = AtomicUsize::new(0);
     let peak = AtomicUsize::new(0);
+    let telemetry_session = crate::manifest::manifest_key(label);
+    let telemetry_session = telemetry_session.as_str();
     let mut downloads: FuturesUnordered<_> = wanted
         .iter()
         .map(|&(action, entry)| {
@@ -317,8 +321,20 @@ async fn prefetch(
                     .expect("prefetch semaphore is never closed");
                 let running = active.fetch_add(1, Ordering::Relaxed) + 1;
                 peak.fetch_max(running, Ordering::Relaxed);
-                let outcome =
-                    download_object(client, base, token, directory, state, action, entry).await;
+                let outcome = download_object(
+                    client,
+                    base,
+                    token,
+                    directory,
+                    state,
+                    PredictedObject {
+                        session_label: telemetry_session,
+                        concurrency,
+                        action,
+                        entry,
+                    },
+                )
+                .await;
                 active.fetch_sub(1, Ordering::Relaxed);
                 match outcome {
                     Ok(fetched) => Some(fetched),
@@ -369,6 +385,13 @@ enum Fetched {
     Miss,
 }
 
+struct PredictedObject<'a> {
+    session_label: &'a str,
+    concurrency: usize,
+    action: &'a str,
+    entry: &'a ManifestEntry,
+}
+
 /// Downloads one predicted object through the ordinary cache route — the exact GET
 /// a foreground miss would issue, plus the telemetry purpose header — verifying
 /// size and digest against the manifest entry before publishing it into the local
@@ -379,21 +402,22 @@ async fn download_object(
     token: Option<&str>,
     directory: &Path,
     session: &SessionState,
-    action: &str,
-    entry: &ManifestEntry,
+    object: PredictedObject<'_>,
 ) -> anyhow::Result<Fetched> {
     // Register before the disk recheck so a concurrent foreground get sees either
     // the finished file or the in-flight marker, never neither.
-    let _inflight = session.begin_download(&entry.output);
-    let path = directory.join(&entry.output);
+    let _inflight = session.begin_download(&object.entry.output);
+    let path = directory.join(&object.entry.output);
     // The work list was computed at startup; a foreground get may have published
     // this object while the download waited behind the concurrency bound.
-    if super::file_has_size(&path, entry.size).await {
+    if super::file_has_size(&path, object.entry.size).await {
         return Ok(Fetched::AlreadyLocal);
     }
     let mut request = client
-        .get(base.join(&format!("go-{action}"))?)
-        .header(REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH);
+        .get(base.join(&format!("go-{}", object.action))?)
+        .header(REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH)
+        .header(REQUEST_PREFETCH_CONCURRENCY_HEADER, object.concurrency)
+        .header(REQUEST_SESSION_HEADER, object.session_label);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
@@ -407,7 +431,7 @@ async fn download_object(
         response.status()
     );
     let temporary = super::temporary_path(directory);
-    if let Err(error) = spool_verified(response, &temporary, entry).await {
+    if let Err(error) = spool_verified(response, &temporary, object.entry).await {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error);
     }
@@ -417,7 +441,7 @@ async fn download_object(
             return Err(error.into());
         }
     }
-    Ok(Fetched::Published(entry.size))
+    Ok(Fetched::Published(object.entry.size))
 }
 
 /// Streams the response body into the temporary file while hashing incrementally,

@@ -325,6 +325,7 @@ pub async fn refresh_once(
     resolver: &dyn Resolver,
     srv_name: &str,
 ) -> anyhow::Result<Duration> {
+    let previous = state.status();
     let snapshot = resolver.srv(srv_name).await?;
     let known: std::collections::HashMap<String, SocketAddr> =
         state.known_addresses().into_iter().collect();
@@ -355,6 +356,22 @@ pub async fn refresh_once(
         }
     }
     state.apply_snapshot(members);
+    let current = state.status();
+    if previous.last_refresh.is_none() || previous.fingerprint != current.fingerprint {
+        tracing::info!(
+            srv = srv_name,
+            members = current.members.len(),
+            ttl_seconds = snapshot.ttl.as_secs(),
+            "routing ring updated"
+        );
+    } else {
+        tracing::debug!(
+            srv = srv_name,
+            members = current.members.len(),
+            ttl_seconds = snapshot.ttl.as_secs(),
+            "routing ring refreshed"
+        );
+    }
     Ok(snapshot.ttl)
 }
 

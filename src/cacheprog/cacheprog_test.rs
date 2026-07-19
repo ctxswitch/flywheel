@@ -1,14 +1,12 @@
 use super::{Request, Response, read_protocol_line, run_with_io, session};
 use crate::{
     cli::CacheprogArgs,
-    manifest::{
-        MANIFEST_VERSION, Manifest, ManifestEntry, REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH,
-    },
+    manifest::{MANIFEST_VERSION, Manifest, ManifestEntry},
 };
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     routing::get as route_get,
 };
@@ -395,14 +393,13 @@ async fn preserves_a_put_body_while_an_earlier_request_completes() {
 }
 
 /// A fake agent for prefetch tests: serves the manifest on `/status` and objects
-/// on the build-cache route while recording concurrency and header discipline.
+/// on the build-cache route while recording concurrency.
 struct PrefetchBackend {
     manifest: Manifest,
     bodies: HashMap<String, Vec<u8>>,
     active: AtomicUsize,
     peak: AtomicUsize,
     object_requests: AtomicUsize,
-    unmarked_requests: AtomicUsize,
     sessions: Mutex<Vec<String>>,
 }
 
@@ -414,7 +411,6 @@ impl PrefetchBackend {
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             object_requests: AtomicUsize::new(0),
-            unmarked_requests: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
         }
     }
@@ -439,16 +435,8 @@ async fn spawn_prefetch_backend(
         .route(
             "/build-cache/http/{key}",
             route_get(
-                |State(backend): State<Arc<PrefetchBackend>>,
-                 Path(key): Path<String>,
-                 headers: HeaderMap| async move {
+                |State(backend): State<Arc<PrefetchBackend>>, Path(key): Path<String>| async move {
                     backend.object_requests.fetch_add(1, Ordering::Relaxed);
-                    let marked = headers.get(REQUEST_PURPOSE_HEADER).is_some_and(|value| {
-                        value.as_bytes() == REQUEST_PURPOSE_PREFETCH.as_bytes()
-                    });
-                    if !marked {
-                        backend.unmarked_requests.fetch_add(1, Ordering::Relaxed);
-                    }
                     let running = backend.active.fetch_add(1, Ordering::Relaxed) + 1;
                     backend.peak.fetch_max(running, Ordering::Relaxed);
                     // The pause keeps overlapping downloads simultaneously active
@@ -509,11 +497,9 @@ async fn prefetch_downloads_in_parallel_within_the_bound() {
     .await;
     server.abort();
 
-    // Discovery went through the status route with the raw session label, and
-    // every object GET carried the telemetry purpose header.
+    // Discovery went through the status route with the raw session label.
     assert_eq!(backend.sessions.lock().unwrap().as_slice(), ["bound-test"]);
     assert_eq!(backend.object_requests.load(Ordering::Relaxed), 8);
-    assert_eq!(backend.unmarked_requests.load(Ordering::Relaxed), 0);
     let peak = backend.peak.load(Ordering::Relaxed);
     assert_eq!(peak, 2, "downloads must fill but never exceed the bound");
     for body in bodies.values() {

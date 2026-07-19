@@ -20,6 +20,11 @@ pub const MANIFEST_MAX_AGE_SECONDS: u64 = 14 * 24 * 60 * 60;
 /// changes routing, admission, authorization, or the response.
 pub const REQUEST_PURPOSE_HEADER: &str = "x-flywheel-request-purpose";
 pub const REQUEST_PURPOSE_PREFETCH: &str = "prefetch";
+pub const REQUEST_PREFETCH_CONCURRENCY_HEADER: &str = "x-flywheel-prefetch-concurrency";
+/// Telemetry-only correlation label attached to prefetch object requests. The
+/// value is the same session label used for manifest discovery and never affects
+/// routing or cache identity.
+pub const REQUEST_SESSION_HEADER: &str = "x-flywheel-session";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Manifest {

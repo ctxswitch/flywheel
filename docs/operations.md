@@ -36,8 +36,37 @@ RUST_LOG=info flywheel serve \
   --data-dir /var/lib/flywheel
 ```
 
-Logs are structured JSON on stderr. `RUST_LOG` controls filtering. Stdout remains unused by
-the server because the `cacheprog` subcommand uses stdout for the Go cache protocol.
+The server and agent write structured JSON logs to stdout at `info` level by default.
+`RUST_LOG` overrides the filter. The `cacheprog` subcommand writes diagnostics to stderr
+because stdout carries its protocol with the Go tool. Prefetch status logs include the
+session, configured download concurrency, manifest size, and lookup duration. Per-object
+transfer details are available at `debug`.
+
+At `debug`, every server and agent request emits one completion record with these stable
+fields:
+
+| Field | Meaning |
+| --- | --- |
+| `component` | `server` or `agent` |
+| `request_id` | Caller-provided `x-request-id`, or a generated ULID |
+| `method` | HTTP method |
+| `operation` | Cache operation or control endpoint |
+| `key` | Actual cache key, reference, artifact digest, or package-proxy key |
+| `status` | Response status on the completion record |
+| `latency` | Time to response headers |
+
+The request ID is returned in the response. An agent preserves it while forwarding to the
+selected ring member, so both processes can be queried with the same value. Access logs do not
+include authorization headers, query strings, or response bodies. Server failures emit an
+additional `error`-level record. The default `info` level
+retains startup, shutdown, maintenance reclamation, ring changes, status fan-out summaries,
+and cacheprog's aggregate prefetch result without emitting records for every cache object.
+
+Pass `--debug` to enable Flywheel debug events and per-request completion logs. For finer
+filtering, use `RUST_LOG=warn` to retain only failures or a directive such as
+`RUST_LOG=flywheel=debug,tower_http=debug`. Collect stdout through the process supervisor or
+container runtime. Collect cacheprog's stderr separately when troubleshooting the helper.
+Flywheel does not rotate or retain log files.
 
 The listener is bound only after the metadata store and artifact root open, the Default
 Channel exists durably, interrupted channel deletions finish, and startup reconciliation
@@ -696,6 +725,7 @@ Replica metrics at `/metrics` are process-wide and have no channel label.
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `flywheel_requests_total` | Counter | All HTTP requests, including health and metrics |
+| `flywheel_http_request_duration_seconds` | Histogram | Time to response headers, labeled by method, normalized route, and status |
 | `flywheel_artifact_hits_total` | Counter | Successful artifact locations |
 | `flywheel_artifact_misses_total` | Counter | Artifact locations that missed |
 | `flywheel_bytes_read_total` | Counter | Full logical body size attributed to each hit, not wire bytes |
@@ -705,6 +735,18 @@ Replica metrics at `/metrics` are process-wide and have no channel label.
 | `flywheel_maintenance_requeued_total` | Counter | Recently used artifacts given a new deadline |
 | `flywheel_build_cache_bypasses_total` | Counter | Build-cache writes accepted without storage under pressure |
 | `flywheel_raw_pressure_errors_total` | Counter | Raw or CAS writes rejected for capacity |
+| `flywheel_foreground_concurrency_limit` | Gauge | Configured foreground admission limit |
+| `flywheel_foreground_in_flight` | Gauge | Admitted operations and active response streams |
+| `flywheel_foreground_rejections_total` | Counter | Requests rejected because foreground admission was exhausted |
+| `flywheel_prefetch_requests_total` | Counter | Prefetch object requests received by the shard |
+| `flywheel_prefetch_responses_total` | Counter | Prefetch response headers, labeled `hit`, `miss`, or `unavailable` |
+| `flywheel_prefetch_in_flight` | Gauge | Prefetch response bodies currently streaming |
+| `flywheel_prefetch_transfers_total` | Counter | Prefetch bodies labeled `completed` or `cancelled` |
+| `flywheel_prefetch_response_bytes_total` | Counter | Prefetch body bytes actually streamed |
+| `flywheel_prefetch_transfer_duration_seconds` | Histogram | Prefetch response-body lifetime |
+| `flywheel_prefetch_status_requests_total` | Counter | Session manifest lookups answered by the shard |
+| `flywheel_prefetch_status_manifest_entries` | Histogram | Entries returned by shard-local session manifests |
+| `flywheel_prefetch_status_duration_seconds` | Histogram | Shard-local manifest lookup latency |
 | `flywheel_free_observed_bytes` | Gauge | Last successful filesystem free-space reading |
 | `flywheel_reserved_bytes` | Gauge | Capacity held by in-flight writes |
 | `flywheel_committed_since_bytes` | Gauge | New bytes not yet included in the free-space reading |
@@ -717,7 +759,14 @@ Recommended alerts and dashboards:
 - Alert when reclamation rises without restoring free space, or pressure persists with no
   reclaimed artifacts.
 - Track hit rate, byte throughput, and authorization-denial rate.
-- Collect stderr logs and alert on repeated publication, maintenance, RocksDB, or
+- Graph `flywheel_foreground_in_flight / flywheel_foreground_concurrency_limit` with
+  `rate(flywheel_foreground_rejections_total[5m])`. A flat prefetch concurrency increase
+  accompanied by foreground rejections identifies shard admission as the limit.
+- Compare the prefetch in-flight gauge with transfer-duration histogram quantiles. A low
+  in-flight value despite available foreground capacity means the client is not supplying
+  parallel work; a full in-flight pool with rising latency means the transfer path is
+  saturated.
+- Collect service stdout logs and alert on repeated publication, maintenance, RocksDB, or
   free-space observation errors.
 
 ## Startup recovery and storage compatibility
@@ -887,21 +936,29 @@ flywheel_agent_synthesized_write_bypasses_total
 flywheel_agent_unavailable_total
 flywheel_agent_ejections_total
 flywheel_agent_status_fanout_requests_total
-flywheel_agent_status_fanout_seconds_total
+flywheel_agent_status_fanout_in_flight
+flywheel_agent_status_fanout_duration_seconds
 flywheel_agent_status_fanout_members_queried_total
 flywheel_agent_status_fanout_members_succeeded_total
 flywheel_agent_status_fanout_members_failed_total
-flywheel_agent_status_fanout_manifest_entries_total
+flywheel_agent_status_fanout_manifest_entries
 flywheel_agent_prefetch_requests_total
 flywheel_agent_prefetch_hits_total
 flywheel_agent_prefetch_misses_total
 flywheel_agent_prefetch_unavailable_total
 flywheel_agent_prefetch_response_bytes_total
+flywheel_agent_prefetch_in_flight
+flywheel_agent_prefetch_completed_total
+flywheel_agent_prefetch_cancelled_total
+flywheel_agent_prefetch_transfer_duration_seconds
+flywheel_agent_forward_duration_seconds
+flywheel_agent_ring_members
+flywheel_agent_ring_ejected
 ```
 
-The `status_fanout` counters describe manifest discovery; `_seconds_total` is a duration
-sum, so its rate divided by the request rate is the mean fan-out latency. The `prefetch`
-counters describe forwarded cache requests carrying the telemetry-only
+The `status_fanout` metrics describe manifest discovery, including concurrent fan-outs,
+latency distribution, members omitted by failures, and returned manifest size. The
+`prefetch` metrics describe forwarded cache requests carrying the telemetry-only
 `x-flywheel-request-purpose: prefetch` header: a hit is a `2xx`, a miss a `404`, and
 everything else — including degraded responses with no owner — is unavailable. The header
 never changes routing, admission, authorization, or responses.
@@ -1094,7 +1151,7 @@ endpoint remains `200` with an empty ring, so inspect `/status` or
 
 ### The replica will not start
 
-Check stderr for the first initialization error. Common causes are:
+Check the service's stdout log stream for the first initialization error. Common causes are:
 
 - the data directory is not writable;
 - another process holds the RocksDB directory;
@@ -1109,7 +1166,7 @@ directory for diagnosis and start with an empty directory when recovery is not r
 
 ### Readiness is `503`
 
-Check filesystem access, RocksDB errors, and free-space observation in stderr. A failed
+Check filesystem access, RocksDB errors, and free-space observation in the service log. A failed
 free-space sensor deliberately refuses reservations. Maintenance refreshes the observation
 every 30 seconds, or continuously while reclaiming.
 

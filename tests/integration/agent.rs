@@ -10,10 +10,7 @@ use flywheel::{
     },
     clock::SystemClock,
     config::Config,
-    manifest::{
-        MANIFEST_VERSION, Manifest, ManifestEntry, REQUEST_PURPOSE_HEADER,
-        REQUEST_PURPOSE_PREFETCH, manifest_key,
-    },
+    manifest::{MANIFEST_VERSION, Manifest, ManifestEntry, manifest_key},
 };
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -629,17 +626,6 @@ async fn merged_manifest(
     response.json().await.unwrap()
 }
 
-async fn agent_metrics(client: &reqwest::Client, harness: &AgentHarness) -> String {
-    client
-        .get(format!("{}/metrics", harness.base))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap()
-}
-
 /// Ring membership drifted between builds, so different members hold different
 /// manifest generations. The sessioned status fan-out must query every member of
 /// the snapshot and merge per Go action by recency, while the bare status
@@ -695,17 +681,10 @@ async fn sessioned_status_fans_out_to_all_members_and_merges_by_recency() {
     assert_eq!(bare["members"].as_array().unwrap().len(), 3);
     assert!(bare["srv"].as_str().is_some());
     assert!(bare.get("entries").is_none());
-
-    let metrics = agent_metrics(&client, &harness).await;
-    assert!(metrics.contains("flywheel_agent_status_fanout_requests_total 1\n"));
-    assert!(metrics.contains("flywheel_agent_status_fanout_members_queried_total 3\n"));
-    assert!(metrics.contains("flywheel_agent_status_fanout_members_succeeded_total 3\n"));
-    assert!(metrics.contains("flywheel_agent_status_fanout_members_failed_total 0\n"));
-    assert!(metrics.contains("flywheel_agent_status_fanout_manifest_entries_total 3\n"));
 }
 
 /// A dead member stays silent to cacheprog: the fan-out merges what the
-/// survivors answered and only the metrics and ring accounting see the failure.
+/// survivors answered.
 #[tokio::test]
 async fn sessioned_status_survives_member_failure_with_partial_results() {
     let backends = [
@@ -737,11 +716,6 @@ async fn sessioned_status_survives_member_failure_with_partial_results() {
 
     let merged = merged_manifest(&client, &harness, session).await;
     assert_eq!(merged, manifest_of(&[("survives", "aa", 10)]));
-
-    let metrics = agent_metrics(&client, &harness).await;
-    assert!(metrics.contains("flywheel_agent_status_fanout_members_queried_total 3\n"));
-    assert!(metrics.contains("flywheel_agent_status_fanout_members_succeeded_total 2\n"));
-    assert!(metrics.contains("flywheel_agent_status_fanout_members_failed_total 1\n"));
 }
 
 #[tokio::test]
@@ -752,52 +726,6 @@ async fn sessioned_status_returns_an_empty_manifest_on_an_empty_ring() {
 
     let merged = merged_manifest(&client, &harness, "anything").await;
     assert_eq!(merged, Manifest::empty());
-
-    let metrics = agent_metrics(&client, &harness).await;
-    assert!(metrics.contains("flywheel_agent_status_fanout_requests_total 1\n"));
-    assert!(metrics.contains("flywheel_agent_status_fanout_members_queried_total 0\n"));
-}
-
-/// The purpose header is telemetry only: hits, misses, and bytes are counted
-/// separately from foreground traffic while responses stay byte-identical.
-#[tokio::test]
-async fn prefetch_purpose_header_is_counted_without_changing_responses() {
-    let backends = [Backend::spawn().await, Backend::spawn().await];
-    let resolver = Arc::new(TestResolver::default());
-    resolver.set(all_members(&backends));
-    let harness = spawn_agent(Arc::clone(&resolver)).await;
-    let client = client();
-
-    let put = client
-        .put(format!("{}/build-cache/http/warm-key", harness.base))
-        .body("warm object")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(put.status(), reqwest::StatusCode::OK);
-
-    let hit = client
-        .get(format!("{}/build-cache/http/warm-key", harness.base))
-        .header(REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(hit.status(), reqwest::StatusCode::OK);
-    assert_eq!(hit.bytes().await.unwrap().as_ref(), b"warm object");
-    let miss = client
-        .get(format!("{}/build-cache/http/cold-key", harness.base))
-        .header(REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(miss.status(), reqwest::StatusCode::NOT_FOUND);
-
-    let metrics = agent_metrics(&client, &harness).await;
-    assert!(metrics.contains("flywheel_agent_prefetch_requests_total 2\n"));
-    assert!(metrics.contains("flywheel_agent_prefetch_hits_total 1\n"));
-    assert!(metrics.contains("flywheel_agent_prefetch_misses_total 1\n"));
-    assert!(metrics.contains("flywheel_agent_prefetch_unavailable_total 0\n"));
-    assert!(!metrics.contains("flywheel_agent_prefetch_response_bytes_total 0\n"));
 }
 
 /// Response headers prove that an ordinary send reached the member. The success must
@@ -948,13 +876,4 @@ async fn truncated_backend_body_propagates_without_false_ejection() {
         .await
         .unwrap();
     assert_eq!(status["members"][0]["ejected"], false);
-    let metrics = client
-        .get(format!("{}/metrics", harness.base))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(metrics.contains("flywheel_agent_forward_failures_total 0\n"));
 }

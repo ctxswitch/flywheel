@@ -70,7 +70,7 @@ impl Flywheel {
             .ensure_default(config.default_expiry_seconds)
             .await?;
         channels.resume_deletions().await?;
-        let metrics = Arc::new(Metrics::default());
+        let metrics = Arc::new(Metrics::new(config.foreground_concurrency)?);
         let space = Arc::new(SpaceLedger::new(
             free_space,
             SpacePolicy {

@@ -19,6 +19,33 @@ async fn request(app: axum::Router, request: Request<Body>) -> axum::response::R
 }
 
 #[tokio::test]
+async fn responses_propagate_or_create_request_ids() {
+    let directory = TempDir::new().unwrap();
+    let app = Flywheel::open(Config::new(directory.path()))
+        .await
+        .unwrap()
+        .router();
+
+    let generated = request(
+        app.clone(),
+        Request::get("/health/ready").body(Body::empty()).unwrap(),
+    )
+    .await;
+    let generated = generated.headers()["x-request-id"].to_str().unwrap();
+    assert!(ulid::Ulid::from_string(generated).is_ok());
+
+    let provided = request(
+        app,
+        Request::get("/health/ready")
+            .header("x-request-id", "caller-request")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(provided.headers()["x-request-id"], "caller-request");
+}
+
+#[tokio::test]
 async fn publishes_streams_ranges_and_recovers_local_artifacts() {
     let directory = TempDir::new().unwrap();
     let body = b"hello durable flywheel";

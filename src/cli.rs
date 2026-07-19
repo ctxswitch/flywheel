@@ -9,6 +9,9 @@ use std::{net::SocketAddr, path::PathBuf};
     about = "Durable local-first build and package cache"
 )]
 pub struct Cli {
+    /// Enable Flywheel debug events and per-request completion logs.
+    #[arg(long, global = true)]
+    pub debug: bool,
     #[command(subcommand)]
     pub command: Command,
 }

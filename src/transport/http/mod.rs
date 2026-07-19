@@ -6,16 +6,19 @@ use crate::{
     },
     channel::{ChannelError, ChannelId, ChannelLease, ChannelRecord, ChannelService, Lifecycle},
     config::Config,
-    manifest::{MANIFEST_VERSION, Manifest, manifest_key},
+    manifest::{
+        MANIFEST_VERSION, Manifest, REQUEST_PREFETCH_CONCURRENCY_HEADER, REQUEST_PURPOSE_HEADER,
+        REQUEST_PURPOSE_PREFETCH, REQUEST_SESSION_HEADER, manifest_key,
+    },
     proxy::ProxyService,
     reference::Reference,
-    telemetry::Metrics,
+    telemetry::{MakeRequestUlid, Metrics, REQUEST_ID_HEADER},
 };
 use async_compression::tokio::bufread::ZstdDecoder;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, Request, State, rejection::JsonRejection},
+    extract::{MatchedPath, Path, Query, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -24,9 +27,15 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{io::SeekFrom, sync::Arc};
+use std::{io::SeekFrom, sync::Arc, time::Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
+use tower::ServiceBuilder;
+use tower_http::{
+    LatencyUnit,
+    request_id::{PropagateRequestIdLayer, SetRequestIdLayer},
+    trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer},
+};
 
 mod packages;
 
@@ -44,8 +53,31 @@ pub struct AppState {
 
 /// One slot of the foreground budget, or `None` when the server is saturated and
 /// the request should shed with a 429.
-fn acquire_foreground(state: &AppState) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    Arc::clone(&state.foreground).try_acquire_owned().ok()
+struct ForegroundPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for ForegroundPermit {
+    fn drop(&mut self) {
+        self.metrics.foreground_released();
+    }
+}
+
+fn acquire_foreground(state: &AppState) -> Option<ForegroundPermit> {
+    match Arc::clone(&state.foreground).try_acquire_owned() {
+        Ok(permit) => {
+            state.metrics.foreground_acquired();
+            Some(ForegroundPermit {
+                _permit: permit,
+                metrics: Arc::clone(&state.metrics),
+            })
+        }
+        Err(_) => {
+            state.metrics.foreground_rejected();
+            None
+        }
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -67,7 +99,74 @@ pub fn router(state: Arc<AppState>) -> Router {
             request_metrics,
             count_request,
         ))
+        .layer(
+            ServiceBuilder::new()
+                .layer(SetRequestIdLayer::new(
+                    REQUEST_ID_HEADER.clone(),
+                    MakeRequestUlid,
+                ))
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(server_request_span)
+                        .on_request(())
+                        .on_response(
+                            DefaultOnResponse::new()
+                                .level(tracing::Level::DEBUG)
+                                .latency_unit(LatencyUnit::Millis),
+                        )
+                        .on_failure(
+                            DefaultOnFailure::new()
+                                .level(tracing::Level::ERROR)
+                                .latency_unit(LatencyUnit::Millis),
+                        ),
+                )
+                .layer(PropagateRequestIdLayer::new(REQUEST_ID_HEADER.clone())),
+        )
         .with_state(state)
+}
+
+fn server_request_span(request: &Request) -> tracing::Span {
+    let (operation, key) = server_request_identity(request);
+    let request_id = request
+        .headers()
+        .get(&REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("invalid");
+    tracing::info_span!(
+        "http_request",
+        component = "server",
+        %request_id,
+        method = %request.method(),
+        %operation,
+        %key,
+    )
+}
+
+fn server_request_identity(request: &Request) -> (String, String) {
+    let path = request.uri().path();
+    let raw_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let segments = match raw_segments.as_slice() {
+        ["channels", _channel, rest @ ..] => rest,
+        rest => rest,
+    };
+    match segments {
+        ["artifacts", _algorithm, digest] => ("artifact".to_owned(), (*digest).to_owned()),
+        ["build-cache", "bazel", "cas", hash] => ("artifact".to_owned(), (*hash).to_owned()),
+        ["build-cache", "bazel", "ac", hash] => ("bazel-action".to_owned(), (*hash).to_owned()),
+        ["build-cache", "http", key] => ("http-cache".to_owned(), (*key).to_owned()),
+        ["references", reference] => ("reference".to_owned(), (*reference).to_owned()),
+        ["proxy", protocol, rest @ ..] if !rest.is_empty() => {
+            ((*protocol).to_owned(), rest.join("/"))
+        }
+        _ => (
+            request
+                .extensions()
+                .get::<MatchedPath>()
+                .map_or("unmatched", MatchedPath::as_str)
+                .to_owned(),
+            String::new(),
+        ),
+    }
 }
 
 fn data_router() -> Router<Arc<AppState>> {
@@ -181,8 +280,18 @@ async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
         }
     }
 }
-async fn metrics(State(state): State<Arc<AppState>>) -> String {
-    state.metrics.render()
+async fn metrics(State(state): State<Arc<AppState>>) -> Response {
+    match state.metrics.encode() {
+        Ok(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, prometheus::TEXT_FORMAT)
+            .body(Body::from(body))
+            .expect("static Prometheus response is valid"),
+        Err(error) => {
+            tracing::error!(%error, "Prometheus metrics encoding failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn count_request(
@@ -191,7 +300,145 @@ async fn count_request(
     next: Next,
 ) -> Response {
     metrics.request();
-    next.run(request).await
+    let method = request.method().clone();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| "unmatched".to_owned(), |path| path.as_str().to_owned());
+    let prefetch = request
+        .headers()
+        .get(REQUEST_PURPOSE_HEADER)
+        .is_some_and(|value| value.as_bytes() == REQUEST_PURPOSE_PREFETCH.as_bytes());
+    let session = request
+        .headers()
+        .get(REQUEST_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let configured_concurrency = request
+        .headers()
+        .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    let observation = prefetch.then(|| {
+        PrefetchObservation::start(
+            Arc::clone(&metrics),
+            route.clone(),
+            session.clone(),
+            configured_concurrency,
+        )
+    });
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let response_headers_duration = started.elapsed();
+    metrics.observe_http_request(
+        method.as_str(),
+        &route,
+        response.status().as_u16(),
+        response_headers_duration,
+    );
+    match observation {
+        Some(observation) => observe_prefetch_body(response, observation),
+        None => response,
+    }
+}
+
+struct PrefetchObservation {
+    metrics: Arc<Metrics>,
+    started: Instant,
+    route: String,
+    session: Option<String>,
+    configured_concurrency: Option<usize>,
+    status: u16,
+    bytes: u64,
+    completed: bool,
+}
+
+impl PrefetchObservation {
+    fn start(
+        metrics: Arc<Metrics>,
+        route: String,
+        session: Option<String>,
+        configured_concurrency: Option<usize>,
+    ) -> Self {
+        let in_flight = metrics.prefetch_started();
+        tracing::debug!(
+            %route,
+            session_id = session.as_deref().unwrap_or(""),
+            configured_concurrency,
+            in_flight,
+            "prefetch request started"
+        );
+        Self {
+            metrics,
+            started: Instant::now(),
+            route,
+            session,
+            configured_concurrency,
+            status: 0,
+            bytes: 0,
+            completed: false,
+        }
+    }
+
+    fn set_status(&mut self, status: u16) {
+        self.status = status;
+        self.metrics.prefetch_response(status);
+    }
+
+    fn add_bytes(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for PrefetchObservation {
+    fn drop(&mut self) {
+        let duration = self.started.elapsed();
+        self.metrics
+            .prefetch_finished(duration, self.bytes, self.completed);
+        tracing::debug!(
+            route = %self.route,
+            session_id = self.session.as_deref().unwrap_or(""),
+            configured_concurrency = self.configured_concurrency,
+            status = self.status,
+            bytes = self.bytes,
+            duration_ms = duration.as_millis() as u64,
+            completed = self.completed,
+            "prefetch request finished"
+        );
+    }
+}
+
+fn observe_prefetch_body(response: Response, mut observation: PrefetchObservation) -> Response {
+    observation.set_status(response.status().as_u16());
+    let (parts, body) = response.into_parts();
+    let stream = Box::pin(body.into_data_stream());
+    let observed = futures_util::stream::unfold(
+        (stream, Some(observation)),
+        |(mut stream, mut observation)| async move {
+            match stream.next().await {
+                Some(Ok(bytes)) => {
+                    observation
+                        .as_mut()
+                        .expect("prefetch observation exists while streaming")
+                        .add_bytes(bytes.len());
+                    Some((Ok(bytes), (stream, observation)))
+                }
+                Some(Err(error)) => Some((Err(error), (stream, observation))),
+                None => {
+                    observation
+                        .take()
+                        .expect("prefetch observation exists at completion")
+                        .complete();
+                    None
+                }
+            }
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(observed))
 }
 
 async fn put_artifact(
@@ -383,7 +630,7 @@ fn accepts_zstd(headers: &HeaderMap) -> bool {
 }
 
 /// Streams a body while holding the foreground permit until the stream is dropped.
-fn body_with_permit<S>(stream: S, permit: tokio::sync::OwnedSemaphorePermit) -> Body
+fn body_with_permit<S>(stream: S, permit: ForegroundPermit) -> Body
 where
     S: futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send + Unpin + 'static,
 {
@@ -955,7 +1202,11 @@ struct StatusQuery {
 /// holds locally in the Default Channel — always `200`, degrading to an empty
 /// manifest when the lookup misses or the stored body is unreadable, because
 /// prefetch never fails a build.
-async fn status(State(state): State<Arc<AppState>>, Query(query): Query<StatusQuery>) -> Response {
+async fn status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<StatusQuery>,
+) -> Response {
     let Some(session) = query.session else {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -963,6 +1214,11 @@ async fn status(State(state): State<Arc<AppState>>, Query(query): Query<StatusQu
             "the session query parameter is required",
         );
     };
+    let configured_concurrency = headers
+        .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    let started = Instant::now();
     let manifest = match local_manifest(&state, &session).await {
         Ok(Some(manifest)) => manifest,
         Ok(None) => Manifest::empty(),
@@ -971,6 +1227,18 @@ async fn status(State(state): State<Arc<AppState>>, Query(query): Query<StatusQu
             Manifest::empty()
         }
     };
+    let duration = started.elapsed();
+    let session_id = manifest_key(&session);
+    state
+        .metrics
+        .prefetch_status_finished(duration, manifest.entries.len());
+    tracing::info!(
+        %session_id,
+        entries = manifest.entries.len(),
+        configured_concurrency,
+        duration_ms = duration.as_millis() as u64,
+        "prefetch session status complete"
+    );
     Json(manifest).into_response()
 }
 

@@ -3,26 +3,58 @@ use flywheel::{
     Flywheel,
     cli::{Cli, Command},
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::fmt::MakeWriter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Logs must stay off stdout: the cacheprog subcommand speaks the GOCACHEPROG
-    // protocol there, and a stray log line would corrupt it.
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .json()
-        .with_writer(std::io::stderr)
-        .init();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    match &cli.command {
+        // Cacheprog speaks the GOCACHEPROG protocol on stdout. Its diagnostics must
+        // stay on stderr so a log record cannot corrupt the protocol stream.
+        Command::Cacheprog(_) => init_logging(std::io::stderr, cli.debug),
+        Command::Serve(_) | Command::Agent(_) => init_logging(std::io::stdout, cli.debug),
+    }
+    match cli.command {
         Command::Serve(arguments) => serve(*arguments).await,
         Command::Cacheprog(arguments) => flywheel::cacheprog::run(arguments).await,
         Command::Agent(arguments) => flywheel::agent::run(arguments).await,
     }
 }
 
+fn init_logging<W>(writer: W, debug: bool)
+where
+    W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
+    let mut filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .from_env_lossy();
+    if debug {
+        filter = filter
+            .add_directive("flywheel=debug".parse().expect("valid debug directive"))
+            .add_directive(
+                "tower_http=debug"
+                    .parse()
+                    .expect("valid HTTP debug directive"),
+            );
+    }
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .flatten_event(true)
+        .with_current_span(true)
+        .with_span_list(false)
+        .with_ansi(false)
+        .with_writer(writer)
+        .init();
+}
+
 async fn serve(arguments: flywheel::cli::ServeArgs) -> anyhow::Result<()> {
+    let startup = Instant::now();
     let listen = arguments.listen;
     let flywheel = Arc::new(Flywheel::open(arguments.config()).await?);
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -32,7 +64,15 @@ async fn serve(arguments: flywheel::cli::ServeArgs) -> anyhow::Result<()> {
         Arc::clone(&flywheel),
         cancellation.clone(),
     ));
-    tracing::info!(%listen, "Flywheel is ready");
+    tracing::info!(
+        component = "server",
+        version = env!("CARGO_PKG_VERSION"),
+        %listen,
+        data_dir = %arguments.data_dir.display(),
+        foreground_concurrency = arguments.foreground_concurrency,
+        startup_ms = startup.elapsed().as_millis() as u64,
+        "Flywheel is ready"
+    );
     axum::serve(listener, flywheel.router())
         .with_graceful_shutdown({
             let cancellation = cancellation.clone();
@@ -40,6 +80,7 @@ async fn serve(arguments: flywheel::cli::ServeArgs) -> anyhow::Result<()> {
                 if let Err(error) = tokio::signal::ctrl_c().await {
                     tracing::error!(%error, "shutdown signal failed");
                 }
+                tracing::info!(component = "server", "shutdown requested");
                 cancellation.cancel();
             }
         })
@@ -47,6 +88,7 @@ async fn serve(arguments: flywheel::cli::ServeArgs) -> anyhow::Result<()> {
     cancellation.cancel();
     let _ = maintenance.await;
     let _ = flywheel.run_maintenance_once().await;
+    tracing::info!(component = "server", "shutdown complete");
     Ok(())
 }
 
@@ -75,6 +117,9 @@ async fn run_maintenance_burst(flywheel: &Arc<Flywheel>, cancellation: &Cancella
                 return;
             }
         };
+        if reclaimed > 0 {
+            tracing::info!(reclaimed, "maintenance pass complete");
+        }
         if !flywheel.is_reclaiming() || cancellation.is_cancelled() {
             return;
         }
