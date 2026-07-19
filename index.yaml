@@ -2,8 +2,28 @@ apiVersion: v1
 entries:
   flywheel:
   - apiVersion: v2
+    appVersion: 0.1.1
+    created: "2026-07-19T22:29:08.19967177Z"
+    description: Production deployment for Flywheel cache shards and the optional
+      hash-ring routing tier.
+    digest: 1dc9bcf8f38ee98106d9bb77aeba6c11d4306784937030552a52718610452adc
+    home: https://github.com/ctxswitch/flywheel
+    keywords:
+    - cache
+    - build-cache
+    - package-proxy
+    - artifact-cache
+    kubeVersion: '>=1.32.0-0'
+    name: flywheel
+    sources:
+    - https://github.com/ctxswitch/flywheel
+    type: application
+    urls:
+    - https://ctxswitch.github.io/flywheel/flywheel-0.1.1.tgz
+    version: 0.1.1
+  - apiVersion: v2
     appVersion: 0.1.0
-    created: "2026-07-18T23:23:07.729797872Z"
+    created: "2026-07-19T22:29:08.198593756Z"
     description: Production deployment for Flywheel cache shards and the optional
       hash-ring routing tier.
     digest: 62c2ce9226c085ab77e75eb5dea13f196e564022b9b358ee9076ef3a04d8603b
@@ -21,4 +41,4 @@ entries:
     urls:
     - https://ctxswitch.github.io/flywheel/flywheel-0.1.0.tgz
     version: 0.1.0
-generated: "2026-07-18T23:23:07.728429142Z"
+generated: "2026-07-19T22:29:08.197302334Z"
