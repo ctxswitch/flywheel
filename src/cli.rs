@@ -176,7 +176,14 @@ pub struct CacheprogArgs {
     #[arg(
         long,
         env = "FLYWHEEL_CACHEPROG_PRUNE_DAYS",
-        default_value_t = crate::cacheprog::session::MANIFEST_MAX_AGE_SECONDS / (24 * 60 * 60)
+        default_value_t = crate::manifest::MANIFEST_MAX_AGE_SECONDS / (24 * 60 * 60)
     )]
     pub prune_days: u64,
+    /// Bound on concurrent prefetch downloads; 0 disables prefetch entirely.
+    #[arg(
+        long,
+        env = "FLYWHEEL_CACHEPROG_PREFETCH_CONCURRENCY",
+        default_value_t = 8
+    )]
+    pub prefetch_concurrency: usize,
 }

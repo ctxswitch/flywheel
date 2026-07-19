@@ -1,12 +1,12 @@
 use crate::{
-    artifact::{ArtifactId, Digest},
+    artifact::ArtifactId,
     cache::{
         CacheError, CacheService, Durability, PublicationOutcome, PublicationTarget,
         PublishRequest, StoredEncoding,
     },
     channel::{ChannelError, ChannelId, ChannelLease, ChannelRecord, ChannelService, Lifecycle},
     config::Config,
-    prefetch::{FrameEncoding, FrameHeader, PrefetchRequest, encode_header},
+    manifest::{MANIFEST_VERSION, Manifest, manifest_key},
     proxy::ProxyService,
     reference::Reference,
     telemetry::Metrics,
@@ -15,7 +15,7 @@ use async_compression::tokio::bufread::ZstdDecoder;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Request, State, rejection::JsonRejection},
+    extract::{Path, Query, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -53,6 +53,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/metrics", get(metrics))
+        .route("/status", get(status))
         .route("/channels", post(register_channel))
         .route(
             "/channels/{channel}",
@@ -85,7 +86,6 @@ fn data_router() -> Router<Arc<AppState>> {
             "/build-cache/http/{key}",
             get(get_http_cache).put(put_http_cache),
         )
-        .route("/build-cache/prefetch", post(prefetch_build_cache))
         .route(
             "/build-cache/bazel/ac/{hash}",
             get(get_bazel_ac).put(put_bazel_ac),
@@ -944,141 +944,78 @@ async fn serve_reference_artifact(
     }
 }
 
-async fn prefetch_build_cache(
-    State(state): State<Arc<AppState>>,
-    Path(path): Path<ChannelPath>,
-    headers: HeaderMap,
-    Json(request): Json<PrefetchRequest>,
-) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
-    prefetch_response(state, context.channel, request)
+#[derive(Deserialize)]
+struct StatusQuery {
+    session: Option<String>,
 }
 
-/// Streams every requested digest back as one framed response. Unavailable entries
-/// (evicted, never stored, or momentarily busy) become miss frames and the stream
-/// keeps going — prefetch is a prediction, and the client falls back to ordinary
-/// gets for anything missing. Only a truncated file aborts the stream, because
-/// continuing would mis-frame every entry after it.
-fn prefetch_response(
-    state: Arc<AppState>,
-    channel: ChannelId,
-    request: PrefetchRequest,
-) -> Response {
-    if request.digests.len() > crate::prefetch::MAX_DIGESTS {
+/// Shard-local manifest lookup for prefetch discovery: the routing agent fans this
+/// request out to every ring member and merges the answers. The shard derives the
+/// shared manifest key from the session label and answers with whatever manifest it
+/// holds locally in the Default Channel — always `200`, degrading to an empty
+/// manifest when the lookup misses or the stored body is unreadable, because
+/// prefetch never fails a build.
+async fn status(State(state): State<Arc<AppState>>, Query(query): Query<StatusQuery>) -> Response {
+    let Some(session) = query.session else {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "too_many_digests",
-            "prefetch request exceeds the digest limit",
+            "missing_session",
+            "the session query parameter is required",
         );
-    }
-    let mut digests = Vec::with_capacity(request.digests.len());
-    for digest in &request.digests {
-        match Digest::parse(digest) {
-            Ok(digest) => digests.push(digest),
-            Err(_) => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_digest",
-                    "digests must be 64 lowercase hexadecimal characters",
-                );
-            }
-        }
-    }
-    let streamer = PrefetchStreamer {
-        cache: Arc::clone(&state.cache),
-        foreground: Arc::clone(&state.foreground),
-        channel,
-        digests: digests.into_iter(),
-        current: None,
     };
-    let stream = futures_util::stream::unfold(streamer, |mut streamer| async move {
-        streamer.next_chunk().await.map(|chunk| (chunk, streamer))
-    });
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, crate::prefetch::CONTENT_TYPE)
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
-struct PrefetchStreamer {
-    cache: Arc<CacheService>,
-    foreground: Arc<tokio::sync::Semaphore>,
-    channel: ChannelId,
-    digests: std::vec::IntoIter<Digest>,
-    current: Option<PrefetchEntry>,
-}
-
-/// The entry currently streaming: its open file, the stored bytes still owed to the
-/// frame, and the foreground permit held until this entry finishes.
-struct PrefetchEntry {
-    file: tokio::fs::File,
-    remaining: u64,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl PrefetchStreamer {
-    async fn next_chunk(&mut self) -> Option<std::io::Result<bytes::Bytes>> {
-        loop {
-            if let Some(current) = &mut self.current {
-                if current.remaining == 0 {
-                    self.current = None;
-                    continue;
-                }
-                let take = usize::try_from(current.remaining.min(64 * 1024)).expect("chunk fits");
-                let mut buffer = vec![0; take];
-                return match current.file.read(&mut buffer).await {
-                    Ok(0) => Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "stored artifact ended before its recorded length",
-                    ))),
-                    Ok(read) => {
-                        current.remaining -= read as u64;
-                        buffer.truncate(read);
-                        Some(Ok(buffer.into()))
-                    }
-                    Err(error) => Some(Err(error)),
-                };
-            }
-            let digest = self.digests.next()?;
-            let artifact = ArtifactId::from_digest(digest);
-            // A saturated foreground budget downgrades the entry to a miss frame —
-            // prefetch is a prediction and the client falls back to ordinary gets.
-            let Ok(permit) = Arc::clone(&self.foreground).try_acquire_owned() else {
-                let header = FrameHeader::miss(digest.to_string());
-                return Some(Ok(encode_header(&header).into()));
-            };
-            let header = match self.cache.locate(self.channel, artifact).await {
-                Ok(Some(located)) => {
-                    let header = FrameHeader {
-                        digest: digest.to_string(),
-                        miss: false,
-                        stored_len: located.metadata.stored_len,
-                        content_len: located.metadata.content_len,
-                        encoding: match located.metadata.encoding {
-                            StoredEncoding::Zstd => FrameEncoding::Zstd,
-                            StoredEncoding::Identity => FrameEncoding::Identity,
-                        },
-                    };
-                    self.current = Some(PrefetchEntry {
-                        file: located.file,
-                        remaining: header.stored_len,
-                        _permit: permit,
-                    });
-                    header
-                }
-                Ok(None) => FrameHeader::miss(digest.to_string()),
-                Err(error) => {
-                    tracing::warn!(%error, "prefetch entry lookup failed");
-                    FrameHeader::miss(digest.to_string())
-                }
-            };
-            return Some(Ok(encode_header(&header).into()));
+    let manifest = match local_manifest(&state, &session).await {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => Manifest::empty(),
+        Err(error) => {
+            tracing::warn!(%error, "session manifest lookup failed");
+            Manifest::empty()
         }
+    };
+    Json(manifest).into_response()
+}
+
+async fn local_manifest(
+    state: &Arc<AppState>,
+    session: &str,
+) -> Result<Option<Manifest>, CacheError> {
+    // A saturated foreground budget degrades to an empty manifest rather than
+    // shedding: prefetch is a prediction, not traffic worth queueing for.
+    let Some(_permit) = acquire_foreground(state) else {
+        return Ok(None);
+    };
+    let reference = build_reference("http", &manifest_key(session));
+    let Some(record) = state
+        .cache
+        .resolve_reference(ChannelId::DEFAULT, &reference)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(located) = state
+        .cache
+        .locate(ChannelId::DEFAULT, record.artifact)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut content = Vec::new();
+    let read = match located.metadata.encoding {
+        StoredEncoding::Zstd => {
+            ZstdDecoder::new(tokio::io::BufReader::new(located.file))
+                .read_to_end(&mut content)
+                .await
+        }
+        StoredEncoding::Identity => {
+            let mut file = located.file;
+            file.read_to_end(&mut content).await
+        }
+    };
+    if read.is_err() {
+        return Ok(None);
     }
+    Ok(serde_json::from_slice::<Manifest>(&content)
+        .ok()
+        .filter(|manifest| manifest.version == MANIFEST_VERSION))
 }
 
 async fn put_bazel_cas(

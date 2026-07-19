@@ -1,4 +1,6 @@
-use super::discovery::{RingState, canonical_member_id, refresh_once, Resolver, SrvRecord, SrvSnapshot};
+use super::discovery::{
+    Resolver, RingState, SrvRecord, SrvSnapshot, canonical_member_id, refresh_once,
+};
 use super::ring::RingMember;
 use crate::clock::Clock;
 use std::{
@@ -135,8 +137,7 @@ fn address_change_moves_no_ring_positions() {
     let after = state.ring();
     assert_eq!(before.fingerprint(), after.fingerprint());
     for sample in 0..500_u32 {
-        let position =
-            super::ring::key_position("artifact", &format!("key-{sample}")).unwrap();
+        let position = super::ring::key_position("artifact", &format!("key-{sample}")).unwrap();
         assert_eq!(
             before.owner(position).unwrap().id,
             after.owner(position).unwrap().id

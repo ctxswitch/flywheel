@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod proxy_test;
 
-
 use crate::{
     artifact::ArtifactId,
     cache::{
@@ -1011,4 +1010,3 @@ pub enum ProxyError {
     #[error(transparent)]
     Cache(#[from] CacheError),
 }
-

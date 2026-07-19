@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod cacheprog_test;
 
-
 use crate::cli::CacheprogArgs;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -145,15 +144,21 @@ where
         args.session.as_deref(),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
-    let manifest_key = session::manifest_key(&label);
-    let mut prefetch_task = Some(tokio::spawn(session::run_prefetch(
-        client.clone(),
-        base.clone(),
-        args.token.clone(),
-        directory.clone(),
-        manifest_key.clone(),
-        Arc::clone(&session_state),
-    )));
+    let manifest_key = crate::manifest::manifest_key(&label);
+    // Concurrency 0 disables prefetch entirely; the manifest lifecycle (fetch on
+    // demand, merge-and-PUT at close) is untouched either way.
+    let mut prefetch_task = (args.prefetch_concurrency > 0).then(|| {
+        tokio::spawn(session::run_prefetch(
+            client.clone(),
+            base.clone(),
+            args.token.clone(),
+            directory.clone(),
+            label,
+            args.prefetch_concurrency,
+            Arc::clone(&session_state),
+        ))
+    });
+    let mut session_finished = false;
 
     write_response(
         &mut writer,
@@ -178,6 +183,7 @@ where
         {
             finish_session(
                 &mut prefetch_task,
+                &mut session_finished,
                 &client,
                 &base,
                 args.token.as_deref(),
@@ -254,6 +260,7 @@ where
     }
     finish_session(
         &mut prefetch_task,
+        &mut session_finished,
         &client,
         &base,
         args.token.as_deref(),
@@ -271,15 +278,20 @@ where
 /// used so the next one can prefetch it.
 async fn finish_session(
     task: &mut Option<tokio::task::JoinHandle<()>>,
+    finished: &mut bool,
     client: &reqwest::Client,
     base: &reqwest::Url,
     token: Option<&str>,
     manifest_key: &str,
     state: &SessionState,
 ) {
-    let Some(task) = task.take() else { return };
-    task.abort();
-    let _ = task.await;
+    if std::mem::replace(finished, true) {
+        return;
+    }
+    if let Some(task) = task.take() {
+        task.abort();
+        let _ = task.await;
+    }
     session::finalize(client, base, token, manifest_key, state).await;
 }
 
@@ -386,6 +398,15 @@ async fn get(
     // answers with zero requests. The file only exists if something verified it.
     if let Some(entry) = session.manifest_entry(&action) {
         let path = directory.join(&entry.output);
+        // If the prefetch pool is pulling this exact object, wait for it instead
+        // of downloading the same bytes again: Go's own build parallelism bounds
+        // the waiters, and the signal fires however the download ends, so a
+        // failed one simply falls through to the ordinary request below.
+        if !file_has_size(&path, entry.size).await
+            && let Some(mut pending) = session.download_in_progress(&entry.output)
+        {
+            let _ = pending.changed().await;
+        }
         if file_has_size(&path, entry.size).await {
             touch(&path);
             return Ok(Response {
@@ -488,11 +509,17 @@ async fn write_disk_file(directory: &Path, name: &str, body: &[u8]) -> anyhow::R
     canonical_path(&path).await
 }
 
+/// A fresh temporary path in `parent`, named so `prune_stale_files` recognizes and
+/// eventually removes abandoned ones from crashed sessions.
+fn temporary_path(parent: &Path) -> PathBuf {
+    parent.join(format!(".{}.{}.tmp", Ulid::new(), std::process::id()))
+}
+
 async fn write_atomic(path: &Path, body: &[u8]) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("cache path has no parent"))?;
-    let temporary = parent.join(format!(".{}.{}.tmp", Ulid::new(), std::process::id()));
+    let temporary = temporary_path(parent);
     let mut file = tokio::fs::File::create(&temporary).await?;
     if let Err(error) = file.write_all(body).await {
         let _ = tokio::fs::remove_file(&temporary).await;
@@ -604,4 +631,3 @@ fn serialize_bytes<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
-

@@ -10,7 +10,10 @@ use flywheel::{
     },
     clock::SystemClock,
     config::Config,
-    prefetch::{FrameDecoder, FrameEncoding},
+    manifest::{
+        MANIFEST_VERSION, Manifest, ManifestEntry, REQUEST_PURPOSE_HEADER,
+        REQUEST_PURPOSE_PREFETCH, manifest_key,
+    },
 };
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -571,109 +574,78 @@ async fn agents_with_divergent_membership_views_both_serve_safely() {
     }
 }
 
-#[tokio::test]
-async fn prefetch_fans_out_by_owner_and_returns_every_frame() {
-    let backends = [
-        Backend::spawn().await,
-        Backend::spawn().await,
-        Backend::spawn().await,
-    ];
-    let resolver = Arc::new(TestResolver::default());
-    resolver.set(all_members(&backends));
-    let harness = spawn_agent(Arc::clone(&resolver)).await;
-    let client = client();
-
-    let mut digests = Vec::new();
-    let mut bodies = std::collections::HashMap::new();
-    for sample in 0..12 {
-        let body = format!("prefetch object {sample}").into_bytes();
-        let digest = digest_of(&body);
-        let put = client
-            .put(format!("{}/artifacts/sha256/{digest}", harness.base))
-            .body(body.clone())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(put.status(), reqwest::StatusCode::CREATED);
-        bodies.insert(digest.clone(), body);
-        digests.push(digest);
+fn manifest_of(entries: &[(&str, &str, u64)]) -> Manifest {
+    Manifest {
+        version: MANIFEST_VERSION,
+        entries: entries
+            .iter()
+            .map(|(action, output, last_seen)| {
+                (
+                    (*action).to_owned(),
+                    ManifestEntry {
+                        output: (*output).to_owned(),
+                        size: 1,
+                        last_seen: *last_seen,
+                    },
+                )
+            })
+            .collect(),
     }
-    // The published objects spread across more than one backend, so the fan-out
-    // really concatenates several upstream sub-responses.
-    let mut holding_backends = 0;
-    for backend in &backends {
-        for digest in &digests {
-            let direct = client
-                .get(format!(
-                    "http://{}/artifacts/sha256/{digest}",
-                    backend.address
-                ))
-                .send()
-                .await
-                .unwrap();
-            if direct.status().is_success() {
-                holding_backends += 1;
-                break;
-            }
-        }
-    }
-    assert!(holding_backends > 1);
+}
 
-    let absent = digest_of(b"never published");
-    let mut requested = digests.clone();
-    requested.push(absent.clone());
+/// Stores a shard-local manifest generation the way cacheprog's finalize does:
+/// directly on one member, under the shared session key.
+async fn put_manifest(
+    client: &reqwest::Client,
+    backend: &Backend,
+    session: &str,
+    manifest: &Manifest,
+) {
     let response = client
-        .post(format!("{}/build-cache/prefetch", harness.base))
-        .json(&serde_json::json!({ "digests": requested }))
+        .put(format!(
+            "http://{}/build-cache/http/{}",
+            backend.address,
+            manifest_key(session)
+        ))
+        .body(serde_json::to_vec(manifest).unwrap())
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let payload = response.bytes().await.unwrap();
-
-    let mut decoder = FrameDecoder::new(payload.as_ref());
-    let mut seen = std::collections::HashMap::new();
-    while let Some((header, body)) = decoder.next_frame().await.unwrap() {
-        seen.insert(header.digest.clone(), (header, body));
-    }
-    assert_eq!(seen.len(), requested.len());
-    assert!(seen[&absent].0.miss);
-    for (digest, body) in &bodies {
-        let (header, stored) = &seen[digest];
-        assert!(!header.miss, "{digest} unexpectedly missed");
-        assert_eq!(stored, body);
-        assert_eq!(header.content_len, body.len() as u64);
-    }
 }
 
-/// Decodes a prefetch response into digest → decompressed content (`None` for a
-/// miss frame), the way the cacheprog client consumes it.
-async fn decode_prefetch(payload: &[u8]) -> std::collections::HashMap<String, Option<Vec<u8>>> {
-    use tokio::io::AsyncReadExt as _;
-    let mut decoder = FrameDecoder::new(payload);
-    let mut seen = std::collections::HashMap::new();
-    while let Some((header, body)) = decoder.next_frame().await.unwrap() {
-        let content = if header.miss {
-            None
-        } else if header.encoding == FrameEncoding::Zstd {
-            let mut zstd = async_compression::tokio::bufread::ZstdDecoder::new(body.as_slice());
-            let mut content = Vec::new();
-            zstd.read_to_end(&mut content).await.unwrap();
-            Some(content)
-        } else {
-            Some(body)
-        };
-        seen.insert(header.digest.clone(), content);
-    }
-    seen
+async fn merged_manifest(
+    client: &reqwest::Client,
+    harness: &AgentHarness,
+    session: &str,
+) -> Manifest {
+    let response = client
+        .get(format!("{}/status", harness.base))
+        .query(&[("session", session)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response.json().await.unwrap()
 }
 
-/// The cacheprog flow places bodies by HTTP-cache key while prefetching by
-/// content digest, so the two hashes select unrelated shards. The sweep must
-/// find every object wherever its original write landed, and a dead member's
-/// objects must degrade to misses without disturbing the rest of the stream.
+async fn agent_metrics(client: &reqwest::Client, harness: &AgentHarness) -> String {
+    client
+        .get(format!("{}/metrics", harness.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+/// Ring membership drifted between builds, so different members hold different
+/// manifest generations. The sessioned status fan-out must query every member of
+/// the snapshot and merge per Go action by recency, while the bare status
+/// response stays the operational ring view.
 #[tokio::test]
-async fn prefetch_finds_objects_wherever_the_original_write_placed_them() {
+async fn sessioned_status_fans_out_to_all_members_and_merges_by_recency() {
     let backends = [
         Backend::spawn().await,
         Backend::spawn().await,
@@ -683,68 +655,149 @@ async fn prefetch_finds_objects_wherever_the_original_write_placed_them() {
     resolver.set(all_members(&backends));
     let harness = spawn_agent(Arc::clone(&resolver)).await;
     let client = client();
+    // Spaces and slashes exercise the URL-encoded raw-label contract.
+    let session = "ci example.com/widget linux/amd64";
 
-    let mut bodies = std::collections::HashMap::new();
-    let mut holder_of = std::collections::HashMap::new();
-    for sample in 0..9 {
-        let key = format!("go-action-{sample}");
-        let body = format!("go build output {sample}").into_bytes();
-        let put = client
-            .put(format!("{}/build-cache/http/{key}", harness.base))
-            .body(body.clone())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(put.status(), reqwest::StatusCode::OK);
-        let digest = digest_of(&body);
-        for (ordinal, backend) in backends.iter().enumerate() {
-            if backend_has_key(&client, backend, &key).await {
-                holder_of.insert(digest.clone(), ordinal);
-            }
-        }
-        bodies.insert(digest, body);
-    }
-    assert_eq!(holder_of.len(), bodies.len());
+    put_manifest(
+        &client,
+        &backends[0],
+        session,
+        &manifest_of(&[("shared", "aa", 10), ("only-first", "bb", 5)]),
+    )
+    .await;
+    put_manifest(
+        &client,
+        &backends[1],
+        session,
+        &manifest_of(&[("shared", "cc", 20), ("only-second", "dd", 7)]),
+    )
+    .await;
 
-    let absent = digest_of(b"never published");
-    let mut requested: Vec<String> = bodies.keys().cloned().collect();
-    requested.push(absent.clone());
-    let payload = client
-        .post(format!("{}/build-cache/prefetch", harness.base))
-        .json(&serde_json::json!({ "digests": requested }))
+    let merged = merged_manifest(&client, &harness, session).await;
+    assert_eq!(
+        merged,
+        manifest_of(&[
+            ("shared", "cc", 20),
+            ("only-first", "bb", 5),
+            ("only-second", "dd", 7),
+        ])
+    );
+
+    // The bare status response is the ring view, not a manifest.
+    let bare: serde_json::Value = client
+        .get(format!("{}/status", harness.base))
         .send()
         .await
         .unwrap()
-        .bytes()
+        .json()
         .await
         .unwrap();
-    let seen = decode_prefetch(&payload).await;
-    assert_eq!(seen.len(), requested.len());
-    assert_eq!(seen[&absent], None);
-    for (digest, body) in &bodies {
-        assert_eq!(seen[digest].as_ref(), Some(body), "{digest} not served");
-    }
+    assert_eq!(bare["members"].as_array().unwrap().len(), 3);
+    assert!(bare["srv"].as_str().is_some());
+    assert!(bare.get("entries").is_none());
 
-    // Kill one holder: its objects become misses, everything else still streams.
-    backends[0].kill().await;
-    let payload = client
-        .post(format!("{}/build-cache/prefetch", harness.base))
-        .json(&serde_json::json!({ "digests": requested }))
+    let metrics = agent_metrics(&client, &harness).await;
+    assert!(metrics.contains("flywheel_agent_status_fanout_requests_total 1\n"));
+    assert!(metrics.contains("flywheel_agent_status_fanout_members_queried_total 3\n"));
+    assert!(metrics.contains("flywheel_agent_status_fanout_members_succeeded_total 3\n"));
+    assert!(metrics.contains("flywheel_agent_status_fanout_members_failed_total 0\n"));
+    assert!(metrics.contains("flywheel_agent_status_fanout_manifest_entries_total 3\n"));
+}
+
+/// A dead member stays silent to cacheprog: the fan-out merges what the
+/// survivors answered and only the metrics and ring accounting see the failure.
+#[tokio::test]
+async fn sessioned_status_survives_member_failure_with_partial_results() {
+    let backends = [
+        Backend::spawn().await,
+        Backend::spawn().await,
+        Backend::spawn().await,
+    ];
+    let resolver = Arc::new(TestResolver::default());
+    resolver.set(all_members(&backends));
+    let harness = spawn_agent(Arc::clone(&resolver)).await;
+    let client = client();
+    let session = "partial-fanout";
+
+    put_manifest(
+        &client,
+        &backends[0],
+        session,
+        &manifest_of(&[("survives", "aa", 10)]),
+    )
+    .await;
+    put_manifest(
+        &client,
+        &backends[1],
+        session,
+        &manifest_of(&[("lost-with-member", "bb", 20)]),
+    )
+    .await;
+    backends[1].kill().await;
+
+    let merged = merged_manifest(&client, &harness, session).await;
+    assert_eq!(merged, manifest_of(&[("survives", "aa", 10)]));
+
+    let metrics = agent_metrics(&client, &harness).await;
+    assert!(metrics.contains("flywheel_agent_status_fanout_members_queried_total 3\n"));
+    assert!(metrics.contains("flywheel_agent_status_fanout_members_succeeded_total 2\n"));
+    assert!(metrics.contains("flywheel_agent_status_fanout_members_failed_total 1\n"));
+}
+
+#[tokio::test]
+async fn sessioned_status_returns_an_empty_manifest_on_an_empty_ring() {
+    let resolver = Arc::new(TestResolver::default());
+    let harness = spawn_agent(resolver).await;
+    let client = client();
+
+    let merged = merged_manifest(&client, &harness, "anything").await;
+    assert_eq!(merged, Manifest::empty());
+
+    let metrics = agent_metrics(&client, &harness).await;
+    assert!(metrics.contains("flywheel_agent_status_fanout_requests_total 1\n"));
+    assert!(metrics.contains("flywheel_agent_status_fanout_members_queried_total 0\n"));
+}
+
+/// The purpose header is telemetry only: hits, misses, and bytes are counted
+/// separately from foreground traffic while responses stay byte-identical.
+#[tokio::test]
+async fn prefetch_purpose_header_is_counted_without_changing_responses() {
+    let backends = [Backend::spawn().await, Backend::spawn().await];
+    let resolver = Arc::new(TestResolver::default());
+    resolver.set(all_members(&backends));
+    let harness = spawn_agent(Arc::clone(&resolver)).await;
+    let client = client();
+
+    let put = client
+        .put(format!("{}/build-cache/http/warm-key", harness.base))
+        .body("warm object")
         .send()
         .await
-        .unwrap()
-        .bytes()
+        .unwrap();
+    assert_eq!(put.status(), reqwest::StatusCode::OK);
+
+    let hit = client
+        .get(format!("{}/build-cache/http/warm-key", harness.base))
+        .header(REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH)
+        .send()
         .await
         .unwrap();
-    let seen = decode_prefetch(&payload).await;
-    assert_eq!(seen.len(), requested.len());
-    for (digest, body) in &bodies {
-        if holder_of[digest] == 0 {
-            assert_eq!(seen[digest], None, "{digest} should miss after scale-down");
-        } else {
-            assert_eq!(seen[digest].as_ref(), Some(body), "{digest} lost");
-        }
-    }
+    assert_eq!(hit.status(), reqwest::StatusCode::OK);
+    assert_eq!(hit.bytes().await.unwrap().as_ref(), b"warm object");
+    let miss = client
+        .get(format!("{}/build-cache/http/cold-key", harness.base))
+        .header(REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(miss.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let metrics = agent_metrics(&client, &harness).await;
+    assert!(metrics.contains("flywheel_agent_prefetch_requests_total 2\n"));
+    assert!(metrics.contains("flywheel_agent_prefetch_hits_total 1\n"));
+    assert!(metrics.contains("flywheel_agent_prefetch_misses_total 1\n"));
+    assert!(metrics.contains("flywheel_agent_prefetch_unavailable_total 0\n"));
+    assert!(!metrics.contains("flywheel_agent_prefetch_response_bytes_total 0\n"));
 }
 
 /// Response headers prove that an ordinary send reached the member. The success must
@@ -805,11 +858,11 @@ async fn successful_headers_reset_forward_failure_streak_before_body_consumption
     backend_task.abort();
 }
 
-/// Prefetch uses the same send-time health rule. A response whose headers arrive but
-/// whose frame stream truncates resets the streak; truncation remains a per-request
-/// miss and does not make the following connect failure eject at a limit of two.
+/// The sessioned status fan-out uses the same send-time health rule as ordinary
+/// forwards: response headers from a member reset its failure streak, so a
+/// successful fan-out answer heals a prior connect failure before the next one.
 #[tokio::test]
-async fn successful_prefetch_headers_reset_failure_streak_before_truncated_body() {
+async fn successful_fanout_headers_reset_failure_streak() {
     let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_address = unused.local_addr().unwrap();
     drop(unused);
@@ -818,73 +871,22 @@ async fn successful_prefetch_headers_reset_failure_streak_before_truncated_body(
     resolver.set(vec![(member_id.clone(), dead_address)]);
     let harness = spawn_agent_with_failure_limit(Arc::clone(&resolver), 2).await;
     let client = client();
-    let digest = digest_of(b"prefetch health probe");
-    let prefetch = format!("{}/build-cache/prefetch", harness.base);
 
-    client
-        .post(&prefetch)
-        .json(&serde_json::json!({"digests": [digest]}))
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
+    merged_manifest(&client, &harness, "streak-probe").await;
     assert_eq!(member_status(&client, &harness).await["failures"], 1);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let live_address = listener.local_addr().unwrap();
-    let backend = axum::Router::new().fallback(|| async {
-        use futures_util::StreamExt as _;
-        let body = axum::body::Body::from_stream(
-            futures_util::stream::iter([
-                Ok(bytes::Bytes::from_static(b"truncated frame")),
-                Err(std::io::Error::other("prefetch body truncated")),
-            ])
-            .then(|item| async {
-                if item.is_err() {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                item
-            }),
-        );
-        axum::response::Response::builder()
-            .status(200)
-            .body(body)
-            .unwrap()
-    });
-    let backend_task = tokio::spawn(async move {
-        axum::serve(listener, backend).await.unwrap();
-    });
-    resolver.set(vec![(member_id.clone(), live_address)]);
+    let backend = Backend::spawn().await;
+    resolver.set(vec![(member_id.clone(), backend.address)]);
     harness.agent.refresh_once().await.unwrap();
-    client
-        .post(&prefetch)
-        .json(&serde_json::json!({"digests": [digest]}))
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
+    merged_manifest(&client, &harness, "streak-probe").await;
     assert_eq!(member_status(&client, &harness).await["failures"], 0);
 
     resolver.set(vec![(member_id, dead_address)]);
     harness.agent.refresh_once().await.unwrap();
-    client
-        .post(&prefetch)
-        .json(&serde_json::json!({"digests": [digest]}))
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
+    merged_manifest(&client, &harness, "streak-probe").await;
     let status = member_status(&client, &harness).await;
     assert_eq!(status["failures"], 1);
     assert_eq!(status["ejected"], false);
-
-    backend_task.abort();
 }
 
 /// A backend that returns 200 and then dies mid-body must surface the truncation

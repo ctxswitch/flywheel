@@ -6,7 +6,7 @@ pub mod channel;
 pub mod cli;
 pub mod clock;
 pub mod config;
-pub mod prefetch;
+pub mod manifest;
 pub mod proxy;
 pub mod reference;
 mod storage;

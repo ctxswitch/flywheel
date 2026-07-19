@@ -77,7 +77,10 @@ export GOCACHEPROG='flywheel cacheprog --url http://127.0.0.1:8080/build-cache/h
 go build ./...
 ```
 
-`cacheprog` maintains a verified local object cache and supports session-based prefetching.
+`cacheprog` maintains a verified local object cache and supports session-based prefetching:
+it discovers the session manifest through `GET /status?session=` and warms its local cache
+with bounded parallel cache GETs. Against replicated shards, prefetch requires a pod-local
+`flywheel agent` sidecar, which merges the manifest across shards and routes each download.
 Persistent local directories and Kubernetes `hostPath` mounts are documented in the
 [cacheprog operations guide](docs/operations.md#go-build-cache-with-cacheprog).
 

@@ -143,7 +143,6 @@ The route families are:
 | `/artifacts/{algorithm}/{digest}` | `GET`, `HEAD`, `PUT` | Raw content-addressed artifacts |
 | `/references/{reference}` | `GET`, `PUT`, `DELETE` | Mutable artifact bindings |
 | `/build-cache/http/{key}` | `GET`, `HEAD`, `PUT` | Generic HTTP build cache |
-| `/build-cache/prefetch` | `POST` | Framed bulk retrieval by digest |
 | `/build-cache/bazel/ac/{hash}` | `GET`, `HEAD`, `PUT` | Bazel action cache |
 | `/build-cache/bazel/cas/{hash}` | `GET`, `HEAD`, `PUT` | Bazel content-addressable store |
 | `/proxy/go/{path}` | `GET` | Go module proxy |
@@ -157,11 +156,18 @@ The route families are:
 Only canonical lowercase SHA-256 digests are supported for artifact identities. Reference
 names and build-cache keys must be URL-safe.
 
+One root route exists outside the channel tree: `GET /status?session=<label>` returns the
+`cacheprog` session manifest a replica holds locally in the Default Channel, always as
+`200` JSON, degrading to an empty manifest when the session is unknown or the stored body
+is unreadable. A missing `session` parameter is a `400`. The routing agent serves the same
+route by fanning the request out to every ring member and merging the answers; prefetch
+discovery uses it and it carries no member or completeness information.
+
 ### Common response statuses
 
 | Status | Meaning |
 | --- | --- |
-| `400 Bad Request` | Invalid channel ID, artifact identity, reference, prefetch request, or channel patch |
+| `400 Bad Request` | Invalid channel ID, artifact identity, reference, channel patch, or missing status session parameter |
 | `401 Unauthorized` | Missing or incorrect protected-channel credential |
 | `403 Forbidden` | Package redirect or encoded download targets a disallowed origin |
 | `404 Not Found` | Cache miss, absent channel, or channel in `deleting` |
@@ -554,11 +560,24 @@ GOCACHEPROG='flywheel cacheprog \
 | `--cache-dir` | `FLYWHEEL_CACHEPROG_DIR` | Parent of the persistent `flywheel-cacheprog/` directory |
 | `--session` | `FLYWHEEL_SESSION` | Stable label for the prefetch manifest |
 | `--prune-days` | `FLYWHEEL_CACHEPROG_PRUNE_DAYS` | Local object age limit; default 14, `0` disables pruning |
+| `--prefetch-concurrency` | `FLYWHEEL_CACHEPROG_PREFETCH_CONCURRENCY` | Bound on parallel prefetch downloads; default 8, `0` disables prefetch |
 
 Without `--cache-dir`, the helper uses the system temporary directory. A reusable CI
 volume substantially improves warm builds. The helper verifies digests before publishing a
 local object. Prefetch and its manifest are optimizations; misses fall back to ordinary Go
 cache behavior.
+
+At startup the helper asks `GET /status?session=<label>` at its configured cache origin
+for the session manifest, then warms its object directory with parallel ordinary cache
+GETs bounded by `--prefetch-concurrency`. A foreground Go request for an object the pool
+is currently downloading waits for that download instead of fetching the same bytes
+twice; if the download fails, the request falls back to its ordinary fetch. Against a single replica, the replica answers
+its own status route; in a replicated deployment, point `--url` at a pod-local agent so
+the agent merges the manifest across shards and routes each download to its owner.
+`--prefetch-concurrency 0` is the rollback switch: it disables all prefetch traffic while
+leaving foreground caching and the manifest update at close untouched. The helper logs one
+summary line per session with advertised, locally present, attempted, downloaded, and
+missed objects, bytes, duration, and peak concurrency.
 
 The default session label is the Go module path plus `GOOS` and `GOARCH`, falling back to
 the working directory. Set an explicit session when checkout paths change or when jobs for
@@ -848,7 +867,11 @@ Operational constraints:
   with an empty ring.
 
 Use `GET /status` to inspect the ring fingerprint, last DNS refresh, last discovery error,
-members, failure counts, retry times, and ejection state. Monitor these agent metrics:
+members, failure counts, retry times, and ejection state. `GET /status?session=<label>`
+instead returns the merged `cacheprog` session manifest: the agent queries every member of
+one ring snapshot concurrently, merges successful answers by recency, and returns only the
+manifest — failed members contribute nothing and appear in metrics and logs, never in the
+response. Monitor these agent metrics:
 
 ```text
 flywheel_agent_requests_total
@@ -858,9 +881,38 @@ flywheel_agent_synthesized_misses_total
 flywheel_agent_synthesized_write_bypasses_total
 flywheel_agent_unavailable_total
 flywheel_agent_ejections_total
-flywheel_agent_ring_members
-flywheel_agent_ring_ejected
+flywheel_agent_status_fanout_requests_total
+flywheel_agent_status_fanout_seconds_total
+flywheel_agent_status_fanout_members_queried_total
+flywheel_agent_status_fanout_members_succeeded_total
+flywheel_agent_status_fanout_members_failed_total
+flywheel_agent_status_fanout_manifest_entries_total
+flywheel_agent_prefetch_requests_total
+flywheel_agent_prefetch_hits_total
+flywheel_agent_prefetch_misses_total
+flywheel_agent_prefetch_unavailable_total
+flywheel_agent_prefetch_response_bytes_total
 ```
+
+The `status_fanout` counters describe manifest discovery; `_seconds_total` is a duration
+sum, so its rate divided by the request rate is the mean fan-out latency. The `prefetch`
+counters describe forwarded cache requests carrying the telemetry-only
+`x-flywheel-request-purpose: prefetch` header: a hit is a `2xx`, a miss a `404`, and
+everything else — including degraded responses with no owner — is unavailable. The header
+never changes routing, admission, authorization, or responses.
+
+Recommended dashboards and alerts for prefetch:
+
+- Fan-out health: graph `members_failed` against `members_queried` and alert on a
+  sustained failure ratio — it means shards are unreachable from this agent even if
+  foreground traffic still fails open. Empty manifests are not alertable by themselves;
+  a new session label legitimately starts empty.
+- Prefetch effectiveness: graph the hit ratio (`prefetch_hits` over `prefetch_requests`)
+  and `prefetch_response_bytes` alongside build duration. Alert on prefetch degradation
+  (hit ratio collapsing, or `prefetch_unavailable` rising) rather than on volume.
+- Foreground latency: compare shard request latency before and after raising
+  `--prefetch-concurrency`; speculative traffic shares the same foreground budget on
+  shards, so a too-high bound shows up as foreground `429`s and slower cache reads.
 
 On a DNS lookup failure, the agent retains the last good membership and retries with
 jittered backoff. An authoritative empty SRV answer replaces the ring with an empty one.
@@ -890,6 +942,12 @@ A pod-local agent removes the extra Service hop and gives each build Pod its own
 pools and ring view. It is still only a router: the current agent does not contain an L1
 artifact cache or a channel credential. `flywheel cacheprog` keeps its verified local
 objects in the build container's configured cache directory.
+
+The pod-local agent is the required topology for `cacheprog` prefetch against replicated
+shards: manifest discovery and every prefetch download go through the agent's
+`/status?session=` fan-out and ring routing. Without an agent in front of the ring,
+cacheprog only sees one replica's manifest and objects, and prefetch degrades to whatever
+that replica holds.
 
 Install only the shards and headless discovery Service:
 

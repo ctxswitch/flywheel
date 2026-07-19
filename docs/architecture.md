@@ -316,14 +316,24 @@ content-addressed bodies. Two logical keys that produce identical bytes share on
 Bazel CAS and raw artifact routes address the digest directly and therefore share the same
 body when used in the same channel.
 
-`POST /build-cache/prefetch` accepts a bounded list of digests and returns a framed stream.
-Each entry is either a miss header or a header followed by its stored bytes. A busy or
-missing entry is reported as a miss so normal cache lookup can continue. A truncated body
-terminates the stream because subsequent frame boundaries would be ambiguous.
+The `cacheprog` client warms its local object directory before Go asks, as an optimization
+for Go's `GOCACHEPROG` protocol. Prefetch is ordinary cache traffic issued early and in
+parallel, not a separate protocol. Discovery goes through the agent: cacheprog sends
+`GET /status?session=<label>` to its pod-local agent, the agent sends the same request to
+every member of one ring snapshot concurrently, each shard answers with the session
+manifest it holds locally, and the agent merges the answers per Go action by recency.
+Shards answer the same route directly for single-replica deployments. Cacheprog then
+issues one ordinary `GET /build-cache/http/go-<action>` per predicted object from a
+bounded worker pool; the agent routes each GET to its ring owner like any foreground
+request. A foreground get for an object the pool is mid-download waits for that download
+rather than repeating it, and a queued download that finds its object already on disk
+skips the fetch, so each object crosses the network once per session. Speculative GETs carry a telemetry-only request-purpose header so the agent can
+count them separately; the header changes nothing else.
 
-The `cacheprog` client uses this endpoint as an optimization for Go's `GOCACHEPROG`
-protocol. Prefetched content is verified before it enters the helper's local cache;
-correctness does not depend on the prediction or manifest.
+Every prefetched body is verified against the manifest before it enters the helper's local
+cache, and every failure — empty ring, partial fan-out, missing or invalid manifest,
+failed download — degrades to fewer warm objects. Correctness never depends on the
+prediction or manifest.
 
 ## Package proxy
 
@@ -445,3 +455,4 @@ serve this degradation contract; ring membership must be monitored separately.
 | Package proxy | `src/proxy/`, `src/transport/http/packages.rs` |
 | Scaled routing agent | `src/agent/` |
 | Go cache helper | `src/cacheprog/` |
+| Session manifest vocabulary | `src/manifest.rs` |

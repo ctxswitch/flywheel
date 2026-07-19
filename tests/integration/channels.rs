@@ -60,7 +60,6 @@ async fn data_route_tree_is_visible_bare_and_below_channels() {
         format!("/artifacts/sha256/{digest}"),
         "/references/example".to_owned(),
         "/build-cache/http/example".to_owned(),
-        "/build-cache/prefetch".to_owned(),
         format!("/build-cache/bazel/ac/{digest}"),
         format!("/build-cache/bazel/cas/{digest}"),
         "/proxy/go/example.com/mod/@v/list".to_owned(),
@@ -609,7 +608,6 @@ async fn protected_channel_authorizes_every_data_route_before_foreground_admissi
     .await;
     let digest = "0".repeat(64);
     let binding = json!({"algorithm": "sha256", "digest": digest}).to_string();
-    let prefetch = json!({"digests": ["0".repeat(64)]}).to_string();
     let requests = [
         (Method::GET, format!("/artifacts/sha256/{digest}"), None),
         (
@@ -625,11 +623,6 @@ async fn protected_channel_authorizes_every_data_route_before_foreground_admissi
             Method::PUT,
             "/build-cache/http/example".to_owned(),
             Some(String::new()),
-        ),
-        (
-            Method::POST,
-            "/build-cache/prefetch".to_owned(),
-            Some(prefetch),
         ),
         (Method::GET, format!("/build-cache/bazel/ac/{digest}"), None),
         (
@@ -680,11 +673,7 @@ async fn protected_channel_authorizes_every_data_route_before_foreground_admissi
         let mut request = Request::builder()
             .method(method)
             .uri(format!("/channels/{channel}{suffix}"));
-        if matches!(
-            suffix.as_str(),
-            "/references/example" | "/build-cache/prefetch"
-        ) && body.is_some()
-        {
+        if suffix == "/references/example" && body.is_some() {
             request = request.header(header::CONTENT_TYPE, "application/json");
         }
         let response = call(
@@ -712,28 +701,18 @@ async fn malformed_json_still_precedes_protected_channel_authorization() {
     let registered = register(app.clone(), true).await;
     let channel = registered["channel"].as_str().unwrap();
 
-    for path in [
-        format!("/channels/{channel}/references/example"),
-        format!("/channels/{channel}/build-cache/prefetch"),
-    ] {
-        assert_eq!(
-            call(
-                app.clone(),
-                Request::post(&path)
-                    .method(if path.contains("references") {
-                        Method::PUT
-                    } else {
-                        Method::POST
-                    })
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{"))
-                    .unwrap(),
-            )
-            .await
-            .status(),
-            StatusCode::BAD_REQUEST,
-        );
-    }
+    assert_eq!(
+        call(
+            app.clone(),
+            Request::put(format!("/channels/{channel}/references/example"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST,
+    );
 }
 
 #[tokio::test]

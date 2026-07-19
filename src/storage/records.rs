@@ -31,4 +31,3 @@ pub enum RecordError {
     #[error("could not decode durable record: {0}")]
     Decode(postcard::Error),
 }
-

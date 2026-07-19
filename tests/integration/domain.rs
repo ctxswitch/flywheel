@@ -1,11 +1,11 @@
 use flywheel::{
     artifact::{ArtifactId, Digest},
-    cacheprog::session::{
-        MANIFEST_MAX_AGE_SECONDS, MANIFEST_MAX_ENTRIES, MANIFEST_VERSION, Manifest, ManifestEntry,
-        UsedEntry, compose_label, merge_manifest, parse_module_path,
-    },
+    cacheprog::session::{UsedEntry, compose_label, merge_manifest, parse_module_path},
     channel::{ChannelId, ChannelToken},
-    prefetch::{FrameDecoder, FrameEncoding, FrameHeader, encode_header},
+    manifest::{
+        MANIFEST_MAX_AGE_SECONDS, MANIFEST_MAX_ENTRIES, MANIFEST_VERSION, Manifest, ManifestEntry,
+        merge_manifests,
+    },
     reference::Reference,
 };
 use std::collections::HashMap;
@@ -56,62 +56,6 @@ fn public_references_are_url_safe_and_bounded() {
     assert!(Reference::parse("").is_err());
     assert!(Reference::parse("has/a/slash").is_err());
     assert!(Reference::parse("x".repeat(513)).is_err());
-}
-
-#[tokio::test]
-async fn prefetch_frames_round_trip_hits_and_misses() {
-    let hit = FrameHeader {
-        digest: "aa".repeat(32),
-        miss: false,
-        stored_len: 5,
-        content_len: 11,
-        encoding: FrameEncoding::Zstd,
-    };
-    let miss = FrameHeader::miss("bb".repeat(32));
-    let tail = FrameHeader {
-        digest: "cc".repeat(32),
-        miss: false,
-        stored_len: 3,
-        content_len: 3,
-        encoding: FrameEncoding::Identity,
-    };
-    let mut stream = Vec::new();
-    stream.extend(encode_header(&hit));
-    stream.extend(b"12345");
-    stream.extend(encode_header(&miss));
-    stream.extend(encode_header(&tail));
-    stream.extend(b"xyz");
-
-    let mut decoder = FrameDecoder::new(stream.as_slice());
-    let (header, body) = decoder.next_frame().await.unwrap().unwrap();
-    assert_eq!(header, hit);
-    assert_eq!(body, b"12345");
-    let (header, body) = decoder.next_frame().await.unwrap().unwrap();
-    assert_eq!(header, miss);
-    assert!(body.is_empty());
-    let (header, body) = decoder.next_frame().await.unwrap().unwrap();
-    assert_eq!(header, tail);
-    assert_eq!(body, b"xyz");
-    assert!(decoder.next_frame().await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn prefetch_decoder_rejects_streams_that_end_mid_frame() {
-    let header = FrameHeader {
-        digest: "aa".repeat(32),
-        miss: false,
-        stored_len: 10,
-        content_len: 10,
-        encoding: FrameEncoding::Identity,
-    };
-    let mut mid_body = encode_header(&header);
-    mid_body.extend(b"only4");
-    let mut decoder = FrameDecoder::new(mid_body.as_slice());
-    assert!(decoder.next_frame().await.is_err());
-
-    let mid_header = &encode_header(&header)[..10];
-    let mut decoder = FrameDecoder::new(mid_header);
-    assert!(decoder.next_frame().await.is_err());
 }
 
 fn manifest_entry(output: &str, last_seen: u64) -> ManifestEntry {
@@ -185,6 +129,61 @@ fn manifest_merge_caps_size_by_evicting_the_oldest() {
     for index in 0..5 {
         assert!(!merged.entries.contains_key(&format!("action-{index}")));
     }
+}
+
+#[test]
+fn merge_manifests_unions_shard_answers_by_recency() {
+    let older = Manifest {
+        version: MANIFEST_VERSION,
+        entries: HashMap::from([
+            ("shared".to_owned(), manifest_entry("aa", 10)),
+            ("only-older".to_owned(), manifest_entry("bb", 5)),
+        ]),
+    };
+    let newer = Manifest {
+        version: MANIFEST_VERSION,
+        entries: HashMap::from([
+            ("shared".to_owned(), manifest_entry("cc", 20)),
+            ("only-newer".to_owned(), manifest_entry("dd", 7)),
+        ]),
+    };
+
+    // Order must not matter: recency decides the shared action either way.
+    for manifests in [
+        vec![older.clone(), newer.clone()],
+        vec![newer.clone(), older.clone()],
+    ] {
+        let merged = merge_manifests(manifests);
+        assert_eq!(merged.version, MANIFEST_VERSION);
+        assert_eq!(merged.entries.len(), 3);
+        assert_eq!(merged.entries["shared"], manifest_entry("cc", 20));
+        assert_eq!(merged.entries["only-older"], manifest_entry("bb", 5));
+        assert_eq!(merged.entries["only-newer"], manifest_entry("dd", 7));
+    }
+}
+
+#[test]
+fn merge_manifests_ties_keep_the_first_answer_and_ignore_unknown_versions() {
+    let first = Manifest {
+        version: MANIFEST_VERSION,
+        entries: HashMap::from([("tied".to_owned(), manifest_entry("aa", 10))]),
+    };
+    let second = Manifest {
+        version: MANIFEST_VERSION,
+        entries: HashMap::from([("tied".to_owned(), manifest_entry("bb", 10))]),
+    };
+    let merged = merge_manifests([first, second]);
+    assert_eq!(merged.entries["tied"], manifest_entry("aa", 10));
+
+    // A version-mismatched shard answer contributes nothing.
+    let unknown = Manifest {
+        version: MANIFEST_VERSION + 1,
+        entries: HashMap::from([("tied".to_owned(), manifest_entry("cc", 99))]),
+    };
+    let merged = merge_manifests([merged, unknown]);
+    assert_eq!(merged.entries["tied"], manifest_entry("aa", 10));
+
+    assert_eq!(merge_manifests(Vec::new()), Manifest::empty());
 }
 
 #[test]

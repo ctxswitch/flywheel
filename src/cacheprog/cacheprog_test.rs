@@ -1,8 +1,26 @@
-use super::{Request, Response, read_protocol_line, run_with_io};
-use crate::cli::CacheprogArgs;
-use axum::{Router, extract::Path, http::StatusCode, routing::get as route_get};
+use super::{Request, Response, read_protocol_line, run_with_io, session};
+use crate::{
+    cli::CacheprogArgs,
+    manifest::{
+        MANIFEST_VERSION, Manifest, ManifestEntry, REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH,
+    },
+};
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::get as route_get,
+};
 use sha2::Digest as _;
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
@@ -16,6 +34,9 @@ fn args(url: String, cache_dir: &std::path::Path) -> CacheprogArgs {
         cache_dir: Some(cache_dir.into()),
         session: Some("cacheprog-test".into()),
         prune_days: 14,
+        // The protocol tests run hermetically; prefetch behavior has its own
+        // tests below with explicit concurrency.
+        prefetch_concurrency: 0,
     }
 }
 
@@ -174,14 +195,14 @@ async fn manifest_known_gets_answer_locally_without_any_request() {
         .await
         .unwrap();
     let action = [7u8; 32];
-    let session = crate::cacheprog::session::SessionState::default();
+    let session = session::SessionState::default();
     session
         .manifest
-        .set(crate::cacheprog::session::Manifest {
-            version: crate::cacheprog::session::MANIFEST_VERSION,
-            entries: std::collections::HashMap::from([(
+        .set(Manifest {
+            version: MANIFEST_VERSION,
+            entries: HashMap::from([(
                 hex::encode(action),
-                crate::cacheprog::session::ManifestEntry {
+                ManifestEntry {
                     output: output.clone(),
                     size: body.len() as u64,
                     last_seen: 0,
@@ -222,15 +243,10 @@ async fn preserves_a_put_body_while_an_earlier_request_completes() {
         route_get({
             let get_started = Arc::clone(&get_started);
             let release_get = Arc::clone(&release_get);
-            move |Path(key): Path<String>| {
+            move |Path(_key): Path<String>| {
                 let get_started = Arc::clone(&get_started);
                 let release_get = Arc::clone(&release_get);
                 async move {
-                    // The session manifest lookup must answer immediately so it
-                    // never consumes the object-get rendezvous below.
-                    if key.contains("go-manifest-") {
-                        return StatusCode::NOT_FOUND;
-                    }
                     get_started.notify_one();
                     release_get.notified().await;
                     StatusCode::NOT_FOUND
@@ -314,4 +330,326 @@ async fn preserves_a_put_body_while_an_earlier_request_completes() {
         .join("flywheel-cacheprog")
         .join(hex::encode(sha2::Sha256::digest(b"hello")));
     assert!(object.is_file());
+}
+
+/// A fake agent for prefetch tests: serves the manifest on `/status` and objects
+/// on the build-cache route while recording concurrency and header discipline.
+struct PrefetchBackend {
+    manifest: Manifest,
+    bodies: HashMap<String, Vec<u8>>,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+    object_requests: AtomicUsize,
+    unmarked_requests: AtomicUsize,
+    sessions: Mutex<Vec<String>>,
+}
+
+impl PrefetchBackend {
+    fn new(manifest: Manifest, bodies: HashMap<String, Vec<u8>>) -> Self {
+        Self {
+            manifest,
+            bodies,
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            object_requests: AtomicUsize::new(0),
+            unmarked_requests: AtomicUsize::new(0),
+            sessions: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+async fn spawn_prefetch_backend(
+    backend: Arc<PrefetchBackend>,
+) -> (reqwest::Url, tokio::task::JoinHandle<()>) {
+    let app = Router::new()
+        .route(
+            "/status",
+            route_get(
+                |State(backend): State<Arc<PrefetchBackend>>,
+                 Query(query): Query<HashMap<String, String>>| async move {
+                    if let Some(session) = query.get("session") {
+                        backend.sessions.lock().unwrap().push(session.clone());
+                    }
+                    Json(backend.manifest.clone())
+                },
+            ),
+        )
+        .route(
+            "/build-cache/http/{key}",
+            route_get(
+                |State(backend): State<Arc<PrefetchBackend>>,
+                 Path(key): Path<String>,
+                 headers: HeaderMap| async move {
+                    backend.object_requests.fetch_add(1, Ordering::Relaxed);
+                    let marked = headers.get(REQUEST_PURPOSE_HEADER).is_some_and(|value| {
+                        value.as_bytes() == REQUEST_PURPOSE_PREFETCH.as_bytes()
+                    });
+                    if !marked {
+                        backend.unmarked_requests.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let running = backend.active.fetch_add(1, Ordering::Relaxed) + 1;
+                    backend.peak.fetch_max(running, Ordering::Relaxed);
+                    // The pause keeps overlapping downloads simultaneously active
+                    // so the peak observes real concurrency.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    backend.active.fetch_sub(1, Ordering::Relaxed);
+                    match backend.bodies.get(&key) {
+                        Some(body) => (StatusCode::OK, body.clone()).into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                },
+            ),
+        )
+        .with_state(backend);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (
+        reqwest::Url::parse(&format!("http://{address}/build-cache/http/")).unwrap(),
+        task,
+    )
+}
+
+fn manifest_entry_for(body: &[u8]) -> ManifestEntry {
+    ManifestEntry {
+        output: hex::encode(sha2::Sha256::digest(body)),
+        size: body.len() as u64,
+        last_seen: 1,
+    }
+}
+
+#[tokio::test]
+async fn prefetch_downloads_in_parallel_within_the_bound() {
+    let mut manifest = Manifest::empty();
+    let mut bodies = HashMap::new();
+    for index in 0..8u32 {
+        let body = format!("prefetched object {index}").into_bytes();
+        let action = format!("{index:064x}");
+        manifest
+            .entries
+            .insert(action.clone(), manifest_entry_for(&body));
+        bodies.insert(format!("go-{action}"), body);
+    }
+    let backend = Arc::new(PrefetchBackend::new(manifest, bodies.clone()));
+    let (base, server) = spawn_prefetch_backend(Arc::clone(&backend)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(session::SessionState::default());
+
+    session::run_prefetch(
+        reqwest::Client::new(),
+        base,
+        None,
+        directory.path().to_path_buf(),
+        "bound-test".into(),
+        2,
+        Arc::clone(&state),
+    )
+    .await;
+    server.abort();
+
+    // Discovery went through the status route with the raw session label, and
+    // every object GET carried the telemetry purpose header.
+    assert_eq!(backend.sessions.lock().unwrap().as_slice(), ["bound-test"]);
+    assert_eq!(backend.object_requests.load(Ordering::Relaxed), 8);
+    assert_eq!(backend.unmarked_requests.load(Ordering::Relaxed), 0);
+    let peak = backend.peak.load(Ordering::Relaxed);
+    assert_eq!(peak, 2, "downloads must fill but never exceed the bound");
+    for body in bodies.values() {
+        let path = directory
+            .path()
+            .join(hex::encode(sha2::Sha256::digest(body)));
+        assert_eq!(&tokio::fs::read(&path).await.unwrap(), body);
+    }
+    assert!(state.manifest.get().is_some());
+}
+
+#[tokio::test]
+async fn prefetch_publishes_only_verified_objects_and_tolerates_misses() {
+    let good = b"good object body".to_vec();
+    let advertised = b"advertised bytes".to_vec();
+    let tampered = b"tampered bytes!!".to_vec(); // same length: only the digest differs
+    let absent = b"never stored".to_vec();
+    let mut manifest = Manifest::empty();
+    let mut bodies = HashMap::new();
+    let good_action = format!("{:064x}", 1);
+    manifest
+        .entries
+        .insert(good_action.clone(), manifest_entry_for(&good));
+    bodies.insert(format!("go-{good_action}"), good.clone());
+    let corrupt_action = format!("{:064x}", 2);
+    manifest
+        .entries
+        .insert(corrupt_action.clone(), manifest_entry_for(&advertised));
+    bodies.insert(format!("go-{corrupt_action}"), tampered);
+    let absent_action = format!("{:064x}", 3);
+    manifest
+        .entries
+        .insert(absent_action.clone(), manifest_entry_for(&absent));
+    let backend = Arc::new(PrefetchBackend::new(manifest, bodies));
+    let (base, server) = spawn_prefetch_backend(Arc::clone(&backend)).await;
+    let directory = tempfile::tempdir().unwrap();
+
+    session::run_prefetch(
+        reqwest::Client::new(),
+        base,
+        None,
+        directory.path().to_path_buf(),
+        "verify-test".into(),
+        4,
+        Arc::new(session::SessionState::default()),
+    )
+    .await;
+    server.abort();
+
+    // Only the verified body was published; the corrupted download and the miss
+    // stay future foreground misses, and no temporary file is left behind.
+    let mut published: Vec<String> = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    published.sort();
+    assert_eq!(
+        published,
+        [hex::encode(sha2::Sha256::digest(&good))],
+        "exactly the verified object must be published"
+    );
+}
+
+#[tokio::test]
+async fn prefetch_concurrency_zero_sends_nothing() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().fallback({
+        let requests = Arc::clone(&requests);
+        move || {
+            let requests = Arc::clone(&requests);
+            async move {
+                requests.fetch_add(1, Ordering::Relaxed);
+                StatusCode::NOT_FOUND
+            }
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cache_dir = tempfile::tempdir().unwrap();
+    let input = b"{\"ID\":1,\"Command\":\"close\"}\n";
+    let mut output = Vec::new();
+
+    run_with_io(
+        args(
+            format!("http://{address}/build-cache/http/"),
+            cache_dir.path(),
+        ),
+        BufReader::new(&input[..]),
+        &mut output,
+    )
+    .await
+    .unwrap();
+    server.abort();
+
+    assert_eq!(requests.load(Ordering::Relaxed), 0);
+}
+
+/// A foreground get for an object the prefetch pool is mid-download must wait
+/// for that download and answer locally — one fetch total, not two.
+#[tokio::test]
+async fn foreground_get_waits_for_the_inflight_prefetch_download() {
+    let body = b"contended object body".to_vec();
+    let action = format!("{:064x}", 9);
+    let mut manifest = Manifest::empty();
+    manifest
+        .entries
+        .insert(action.clone(), manifest_entry_for(&body));
+    let object_requests = Arc::new(AtomicUsize::new(0));
+    let download_started = Arc::new(Notify::new());
+    let release_download = Arc::new(Notify::new());
+    let app = Router::new()
+        .route(
+            "/status",
+            route_get({
+                let manifest = manifest.clone();
+                move || {
+                    let manifest = manifest.clone();
+                    async move { Json(manifest) }
+                }
+            }),
+        )
+        .route(
+            "/build-cache/http/{key}",
+            route_get({
+                let object_requests = Arc::clone(&object_requests);
+                let download_started = Arc::clone(&download_started);
+                let release_download = Arc::clone(&release_download);
+                let body = body.clone();
+                move |Path(_key): Path<String>| {
+                    let object_requests = Arc::clone(&object_requests);
+                    let download_started = Arc::clone(&download_started);
+                    let release_download = Arc::clone(&release_download);
+                    let body = body.clone();
+                    async move {
+                        object_requests.fetch_add(1, Ordering::Relaxed);
+                        download_started.notify_one();
+                        release_download.notified().await;
+                        body
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = reqwest::Url::parse(&format!("http://{address}/build-cache/http/")).unwrap();
+    let client = reqwest::Client::new();
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(session::SessionState::default());
+
+    let prefetch = tokio::spawn(session::run_prefetch(
+        client.clone(),
+        base.clone(),
+        None,
+        directory.path().to_path_buf(),
+        "wait-test".into(),
+        1,
+        Arc::clone(&state),
+    ));
+    // The prefetch download is now in flight, blocked inside the server handler.
+    download_started.notified().await;
+
+    let releaser = tokio::spawn({
+        let release_download = Arc::clone(&release_download);
+        async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            release_download.notify_one();
+        }
+    });
+    let response = super::get(
+        &client,
+        &base,
+        None,
+        directory.path(),
+        &state,
+        Request {
+            id: 4,
+            command: "get".into(),
+            action_id: hex::decode(&action).unwrap(),
+            output_id: Vec::new(),
+            body_size: 0,
+        },
+    )
+    .await
+    .unwrap();
+    prefetch.await.unwrap();
+    releaser.await.unwrap();
+    server.abort();
+
+    assert!(!response.miss);
+    assert_eq!(
+        hex::encode(&response.output_id),
+        hex::encode(sha2::Sha256::digest(&body))
+    );
+    assert_eq!(
+        object_requests.load(Ordering::Relaxed),
+        1,
+        "the waiting get must reuse the prefetch download, not repeat it"
+    );
 }

@@ -18,26 +18,26 @@ mod discovery_test;
 mod ring_test;
 use crate::{
     clock::Clock,
-    prefetch::{FrameDecoder, FrameHeader, MAX_DIGESTS, PrefetchRequest, encode_header},
+    manifest::{Manifest, REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH, merge_manifests},
 };
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Request, State},
-    http::{Method, StatusCode, header},
+    extract::{Query, Request, State},
+    http::{Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
-use bytes::Bytes;
 use discovery::{Resolver, RingState, RingStatus};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use ring::RingMember;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -116,7 +116,6 @@ impl Agent {
             .route("/health/ready", get(|| async { StatusCode::OK }))
             .route("/metrics", get(metrics))
             .route("/status", get(status))
-            .route("/build-cache/prefetch", post(prefetch))
             .fallback(forward)
             .with_state(Arc::clone(&self.state))
     }
@@ -244,6 +243,16 @@ fn classify(method: &Method, path: &str) -> RoutedKey {
 
 async fn forward(State(state): State<Arc<AgentState>>, request: Request) -> Response {
     state.metrics.requests.bump();
+    // Telemetry only: the purpose header separates speculative prefetch traffic
+    // from foreground traffic in the counters and is forwarded untouched. It never
+    // affects routing, admission, authorization, or the response.
+    let prefetch = request
+        .headers()
+        .get(REQUEST_PURPOSE_HEADER)
+        .is_some_and(|value| value.as_bytes() == REQUEST_PURPOSE_PREFETCH.as_bytes());
+    if prefetch {
+        state.metrics.prefetch_requests.bump();
+    }
     if request.uri().path() == "/channels" || request.uri().path().starts_with("/channels/") {
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
@@ -252,6 +261,9 @@ async fn forward(State(state): State<Arc<AgentState>>, request: Request) -> Resp
         return StatusCode::URI_TOO_LONG.into_response();
     };
     let Some(owner) = state.ring.ring().owner(position).cloned() else {
+        if prefetch {
+            state.metrics.prefetch_unavailable.bump();
+        }
         return degrade(&state, routed.class, true);
     };
     let path_and_query = request
@@ -278,11 +290,26 @@ async fn forward(State(state): State<Arc<AgentState>>, request: Request) -> Resp
             // reachable. Status and later body consumption do not affect ejection.
             state.ring.record_success(&owner.id);
             state.metrics.forwarded.bump();
+            if prefetch {
+                if response.status().is_success() {
+                    state.metrics.prefetch_hits.bump();
+                    if let Some(length) = response.content_length() {
+                        state.metrics.prefetch_response_bytes.add(length);
+                    }
+                } else if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    state.metrics.prefetch_misses.bump();
+                } else {
+                    state.metrics.prefetch_unavailable.bump();
+                }
+            }
             proxied_response(response)
         }
         Err(error) => {
             tracing::warn!(%error, owner = owner.id, "forwarded request failed");
             record_send_failure(&state, &owner, &error);
+            if prefetch {
+                state.metrics.prefetch_unavailable.bump();
+            }
             degrade(&state, routed.class, false)
         }
     }
@@ -373,12 +400,110 @@ struct AgentStatus {
     ring: RingStatus,
 }
 
-async fn status(State(state): State<Arc<AgentState>>) -> Response {
-    Json(AgentStatus {
-        srv: state.options.srv.clone(),
-        ring: state.ring.status(),
-    })
-    .into_response()
+#[derive(Deserialize)]
+struct StatusQuery {
+    session: Option<String>,
+}
+
+/// Without `?session=`, the operational ring response, unchanged. With a session,
+/// prefetch manifest discovery: the merged manifest for that session label, and
+/// never members, addresses, or completeness — the agent stays the topology
+/// boundary.
+async fn status(
+    State(state): State<Arc<AgentState>>,
+    Query(query): Query<StatusQuery>,
+) -> Response {
+    match query.session.as_deref() {
+        Some(session) => Json(merged_session_manifest(&state, session).await).into_response(),
+        None => Json(AgentStatus {
+            srv: state.options.srv.clone(),
+            ring: state.ring.status(),
+        })
+        .into_response(),
+    }
+}
+
+/// Fans the session lookup out to every member of one ring snapshot concurrently
+/// and merges the answers by recency. Failed members contribute nothing — an
+/// empty ring or a total failure is simply an empty manifest. Runs inside the
+/// handler future, so a client disconnect cancels the outstanding subrequests.
+async fn merged_session_manifest(state: &Arc<AgentState>, session: &str) -> Manifest {
+    let started = Instant::now();
+    state.metrics.status_fanout_requests.bump();
+    let members = state.ring.ring().members().to_vec();
+    state
+        .metrics
+        .status_fanout_members_queried
+        .add(members.len() as u64);
+    let mut pending: FuturesUnordered<_> = members
+        .iter()
+        .map(|member| async move { (member, member_manifest(state, member, session).await) })
+        .collect();
+    let mut manifests = Vec::new();
+    let mut failed = 0u64;
+    while let Some((member, outcome)) = pending.next().await {
+        match outcome {
+            Ok(manifest) => manifests.push(manifest),
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(%error, member = member.id, "status fan-out member failed");
+            }
+        }
+    }
+    drop(pending);
+    let succeeded = members.len() as u64 - failed;
+    let merged = merge_manifests(manifests);
+    state.metrics.status_fanout_members_succeeded.add(succeeded);
+    state.metrics.status_fanout_members_failed.add(failed);
+    state
+        .metrics
+        .status_fanout_manifest_entries
+        .add(merged.entries.len() as u64);
+    state
+        .metrics
+        .status_fanout_seconds
+        .add_duration(started.elapsed());
+    tracing::info!(
+        members = members.len(),
+        succeeded,
+        failed,
+        entries = merged.entries.len(),
+        duration_ms = started.elapsed().as_millis() as u64,
+        "session status fan-out complete"
+    );
+    merged
+}
+
+/// One member's local manifest. Transport failures feed the same ring health
+/// accounting as ordinary forwards; a non-200 or unparseable answer counts
+/// against the fan-out but not against the member's ejection streak.
+async fn member_manifest(
+    state: &AgentState,
+    member: &RingMember,
+    session: &str,
+) -> anyhow::Result<Manifest> {
+    let outcome = state
+        .client
+        .get(format!("http://{}/status", member.address))
+        .query(&[("session", session)])
+        .send()
+        .await;
+    let response = match outcome {
+        Ok(response) => {
+            state.ring.record_success(&member.id);
+            response
+        }
+        Err(error) => {
+            record_send_failure(state, member, &error);
+            return Err(error.into());
+        }
+    };
+    anyhow::ensure!(
+        response.status().is_success(),
+        "member status returned {}",
+        response.status()
+    );
+    Ok(serde_json::from_slice(&response.bytes().await?)?)
 }
 
 async fn metrics(State(state): State<Arc<AgentState>>) -> String {
@@ -391,154 +516,6 @@ async fn metrics(State(state): State<Arc<AgentState>>) -> String {
     state.metrics.render(status.members.len(), ejected)
 }
 
-/// Serves a prefetch by sweeping the ring members in order: the full digest list
-/// goes to the first member, only the still-unserved digests to the next, and
-/// whatever no member returned becomes miss frames. The sweep makes no placement
-/// assumption at all — an object is found on whichever shard its original write
-/// landed on (the cacheprog flow places bodies by HTTP-cache key, not by digest),
-/// and a dead or truncated member simply passes its unserved digests to the next
-/// one. Only complete frames are forwarded, so one bad member cannot corrupt the
-/// framing of the rest.
-async fn prefetch(
-    State(state): State<Arc<AgentState>>,
-    Json(request): Json<PrefetchRequest>,
-) -> Response {
-    state.metrics.requests.bump();
-    if request.digests.len() > MAX_DIGESTS {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "too_many_digests",
-            "prefetch request exceeds the digest limit",
-        );
-    }
-    if request
-        .digests
-        .iter()
-        .any(|digest| crate::artifact::Digest::parse(digest).is_err())
-    {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_digest",
-            "digests must be 64 lowercase hexadecimal characters",
-        );
-    }
-    let members = state.ring.ring().members().to_vec();
-    let (sender, receiver) = tokio::sync::mpsc::channel::<PrefetchChunk>(8);
-    tokio::spawn(prefetch_sweep(
-        Arc::clone(&state),
-        members,
-        request.digests,
-        sender,
-    ));
-    let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
-        receiver.recv().await.map(|chunk| (chunk, receiver))
-    });
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, crate::prefetch::CONTENT_TYPE)
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
-
-type PrefetchChunk = Result<Bytes, std::convert::Infallible>;
-
-async fn prefetch_sweep(
-    state: Arc<AgentState>,
-    members: Vec<RingMember>,
-    mut remaining: Vec<String>,
-    output: tokio::sync::mpsc::Sender<PrefetchChunk>,
-) {
-    for member in members {
-        if remaining.is_empty() {
-            break;
-        }
-        let outcome = state
-            .client
-            .post(format!("http://{}/build-cache/prefetch", member.address))
-            .json(&PrefetchRequest {
-                digests: remaining.clone(),
-            })
-            .send()
-            .await;
-        let response = match outcome {
-            Ok(response) => {
-                // Like ordinary forwarding, response headers reset the streak even
-                // when the status rejects the request or the body later truncates.
-                state.ring.record_success(&member.id);
-                if response.status().is_success() {
-                    response
-                } else {
-                    tracing::warn!(
-                        member = member.id,
-                        status = %response.status(),
-                        "prefetch sweep rejected"
-                    );
-                    continue;
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, member = member.id, "prefetch sweep failed");
-                record_send_failure(&state, &member, &error);
-                continue;
-            }
-        };
-        let body =
-            futures_util::TryStreamExt::map_err(response.bytes_stream(), std::io::Error::other);
-        let mut decoder = FrameDecoder::new(tokio_util::io::StreamReader::new(body));
-        let mut hits = std::collections::HashSet::new();
-        let mut missing = Vec::new();
-        loop {
-            match decoder.next_frame().await {
-                Ok(Some((header, frame_body))) => {
-                    if header.miss {
-                        missing.push(header.digest);
-                        continue;
-                    }
-                    hits.insert(header.digest.clone());
-                    if output
-                        .send(Ok(encode_header(&header).into()))
-                        .await
-                        .is_err()
-                    {
-                        return; // The client went away; nothing left to serve.
-                    }
-                    if !frame_body.is_empty() && output.send(Ok(frame_body.into())).await.is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => {
-                    remaining = missing;
-                    break;
-                }
-                Err(error) => {
-                    // Truncated sub-response: frames already forwarded are whole,
-                    // and everything this member did not fully serve rolls over to
-                    // the next one. A truncated exchange is not a success.
-                    tracing::warn!(%error, member = member.id, "prefetch sub-response truncated");
-                    remaining.retain(|digest| !hits.contains(digest));
-                    break;
-                }
-            }
-        }
-    }
-    for digest in remaining {
-        let frame = Bytes::from(encode_header(&FrameHeader::miss(digest)));
-        if output.send(Ok(frame)).await.is_err() {
-            return;
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ErrorBody {
-    code: &'static str,
-    message: &'static str,
-}
-
-fn api_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
-    (status, Json(ErrorBody { code, message })).into_response()
-}
-
 #[derive(Default)]
 struct Counter(AtomicU64);
 
@@ -546,8 +523,28 @@ impl Counter {
     fn bump(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
+    fn add(&self, value: u64) {
+        self.0.fetch_add(value, Ordering::Relaxed);
+    }
     fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A duration sum counter, accumulated in microseconds and rendered as seconds
+/// (the repo's metrics format has no histograms).
+#[derive(Default)]
+struct SecondsCounter(AtomicU64);
+
+impl SecondsCounter {
+    fn add_duration(&self, duration: Duration) {
+        self.0.fetch_add(
+            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+    fn seconds(&self) -> f64 {
+        self.0.load(Ordering::Relaxed) as f64 / 1e6
     }
 }
 
@@ -560,6 +557,17 @@ struct AgentMetrics {
     synthesized_bypasses: Counter,
     unavailable: Counter,
     ejections: Counter,
+    status_fanout_requests: Counter,
+    status_fanout_seconds: SecondsCounter,
+    status_fanout_members_queried: Counter,
+    status_fanout_members_succeeded: Counter,
+    status_fanout_members_failed: Counter,
+    status_fanout_manifest_entries: Counter,
+    prefetch_requests: Counter,
+    prefetch_hits: Counter,
+    prefetch_misses: Counter,
+    prefetch_unavailable: Counter,
+    prefetch_response_bytes: Counter,
 }
 
 impl AgentMetrics {
@@ -573,6 +581,17 @@ impl AgentMetrics {
                 "# TYPE flywheel_agent_synthesized_write_bypasses_total counter\nflywheel_agent_synthesized_write_bypasses_total {}\n",
                 "# TYPE flywheel_agent_unavailable_total counter\nflywheel_agent_unavailable_total {}\n",
                 "# TYPE flywheel_agent_ejections_total counter\nflywheel_agent_ejections_total {}\n",
+                "# TYPE flywheel_agent_status_fanout_requests_total counter\nflywheel_agent_status_fanout_requests_total {}\n",
+                "# TYPE flywheel_agent_status_fanout_seconds_total counter\nflywheel_agent_status_fanout_seconds_total {}\n",
+                "# TYPE flywheel_agent_status_fanout_members_queried_total counter\nflywheel_agent_status_fanout_members_queried_total {}\n",
+                "# TYPE flywheel_agent_status_fanout_members_succeeded_total counter\nflywheel_agent_status_fanout_members_succeeded_total {}\n",
+                "# TYPE flywheel_agent_status_fanout_members_failed_total counter\nflywheel_agent_status_fanout_members_failed_total {}\n",
+                "# TYPE flywheel_agent_status_fanout_manifest_entries_total counter\nflywheel_agent_status_fanout_manifest_entries_total {}\n",
+                "# TYPE flywheel_agent_prefetch_requests_total counter\nflywheel_agent_prefetch_requests_total {}\n",
+                "# TYPE flywheel_agent_prefetch_hits_total counter\nflywheel_agent_prefetch_hits_total {}\n",
+                "# TYPE flywheel_agent_prefetch_misses_total counter\nflywheel_agent_prefetch_misses_total {}\n",
+                "# TYPE flywheel_agent_prefetch_unavailable_total counter\nflywheel_agent_prefetch_unavailable_total {}\n",
+                "# TYPE flywheel_agent_prefetch_response_bytes_total counter\nflywheel_agent_prefetch_response_bytes_total {}\n",
                 "# TYPE flywheel_agent_ring_members gauge\nflywheel_agent_ring_members {}\n",
                 "# TYPE flywheel_agent_ring_ejected gauge\nflywheel_agent_ring_ejected {}\n",
             ),
@@ -583,9 +602,19 @@ impl AgentMetrics {
             self.synthesized_bypasses.get(),
             self.unavailable.get(),
             self.ejections.get(),
+            self.status_fanout_requests.get(),
+            self.status_fanout_seconds.seconds(),
+            self.status_fanout_members_queried.get(),
+            self.status_fanout_members_succeeded.get(),
+            self.status_fanout_members_failed.get(),
+            self.status_fanout_manifest_entries.get(),
+            self.prefetch_requests.get(),
+            self.prefetch_hits.get(),
+            self.prefetch_misses.get(),
+            self.prefetch_unavailable.get(),
+            self.prefetch_response_bytes.get(),
             members,
             ejected,
         )
     }
 }
-

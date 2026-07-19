@@ -5,7 +5,7 @@ use axum::{
 use flywheel::{
     Flywheel,
     config::Config,
-    prefetch::{FrameDecoder, FrameEncoding},
+    manifest::{MANIFEST_VERSION, Manifest, ManifestEntry, manifest_key},
 };
 use futures_util::stream;
 use serde_json::{Value, json};
@@ -351,99 +351,83 @@ async fn empty_compressed_bodies_ignore_ranges_with_ordinary_negotiation() {
 }
 
 #[tokio::test]
-async fn prefetch_streams_ordered_frames_with_misses_for_unknown_digests() {
+async fn status_returns_the_locally_stored_manifest_for_a_session() {
     let directory = TempDir::new().unwrap();
     let app = Flywheel::open(Config::new(directory.path()))
         .await
         .unwrap()
         .router();
-    let first = "a compressible build output line\n".repeat(100);
-    let second = "another object entirely\n".repeat(100);
-    for (key, body) in [("go-aa", first.clone()), ("go-bb", second.clone())] {
-        assert_eq!(
-            call(
-                app.clone(),
-                Request::put(format!("/build-cache/http/{key}"))
-                    .body(Body::from(body))
-                    .unwrap()
-            )
-            .await
-            .status(),
-            StatusCode::OK
-        );
-    }
-    let first_digest = hex::encode(Sha256::digest(first.as_bytes()));
-    let second_digest = hex::encode(Sha256::digest(second.as_bytes()));
-    let unknown = "0".repeat(64);
+    let manifest = Manifest {
+        version: MANIFEST_VERSION,
+        entries: std::collections::HashMap::from([(
+            "aa".repeat(32),
+            ManifestEntry {
+                output: "bb".repeat(32),
+                size: 42,
+                last_seen: 7,
+            },
+        )]),
+    };
+    // The manifest is stored through the ordinary build-cache route under the
+    // shared key derivation, exactly as cacheprog's finalize writes it.
+    assert_eq!(
+        call(
+            app.clone(),
+            Request::put(format!(
+                "/build-cache/http/{}",
+                manifest_key("ci example.com/widget linux/amd64")
+            ))
+            .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
+            .unwrap(),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
 
     let response = call(
         app,
-        Request::post("/build-cache/prefetch")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                json!({"digests": [first_digest, unknown, second_digest]}).to_string(),
-            ))
+        Request::get("/status?session=ci%20example.com%2Fwidget%20linux%2Famd64")
+            .body(Body::empty())
             .unwrap(),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        flywheel::prefetch::CONTENT_TYPE
-    );
-    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-
-    let mut decoder = FrameDecoder::new(bytes.as_ref());
-    let (header, body) = decoder.next_frame().await.unwrap().unwrap();
-    assert_eq!(header.digest, first_digest);
-    assert_eq!(header.encoding, FrameEncoding::Zstd);
-    assert_eq!(header.content_len, first.len() as u64);
-    assert_eq!(header.stored_len, body.len() as u64);
-    // The frame carries the stored zstd bytes verbatim.
-    let stored: Vec<Vec<u8>> = stored_artifact_files(directory.path())
-        .iter()
-        .map(|path| std::fs::read(path).unwrap())
-        .collect();
-    assert!(stored.contains(&body));
-
-    let (header, body) = decoder.next_frame().await.unwrap().unwrap();
-    assert!(header.miss);
-    assert_eq!(header.digest, unknown);
-    assert!(body.is_empty());
-
-    let (header, body) = decoder.next_frame().await.unwrap().unwrap();
-    assert_eq!(header.digest, second_digest);
-    let mut zstd = async_compression::tokio::bufread::ZstdDecoder::new(body.as_slice());
-    let mut decompressed = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut zstd, &mut decompressed)
-        .await
-        .unwrap();
-    assert_eq!(decompressed, second.as_bytes());
-
-    assert!(decoder.next_frame().await.unwrap().is_none());
+    let returned: Manifest =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(returned, manifest);
 }
 
 #[tokio::test]
-async fn prefetch_rejects_malformed_digests() {
+async fn status_degrades_unknown_sessions_to_an_empty_manifest() {
     let directory = TempDir::new().unwrap();
     let app = Flywheel::open(Config::new(directory.path()))
         .await
         .unwrap()
         .router();
+
     let response = call(
         app,
-        Request::post("/build-cache/prefetch")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json!({"digests": ["not-a-digest"]}).to_string()))
+        Request::get("/status?session=never-built")
+            .body(Body::empty())
             .unwrap(),
     )
     .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned: Manifest =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(returned, Manifest::empty());
+}
+
+#[tokio::test]
+async fn status_requires_the_session_parameter() {
+    let directory = TempDir::new().unwrap();
+    let app = Flywheel::open(Config::new(directory.path()))
+        .await
+        .unwrap()
+        .router();
+
+    let response = call(app, Request::get("/status").body(Body::empty()).unwrap()).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -548,38 +532,10 @@ async fn protected_channel_auth_applies_to_build_cache_routes() {
     );
     assert_eq!(
         call(
-            app.clone(),
+            app,
             Request::put(&path)
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::from("value"))
-                .unwrap()
-        )
-        .await
-        .status(),
-        StatusCode::OK
-    );
-
-    let prefetch = format!("/channels/{channel}/build-cache/prefetch");
-    let digests = json!({"digests": ["0".repeat(64)]}).to_string();
-    assert_eq!(
-        call(
-            app.clone(),
-            Request::post(&prefetch)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(digests.clone()))
-                .unwrap()
-        )
-        .await
-        .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        call(
-            app,
-            Request::post(&prefetch)
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(digests))
                 .unwrap()
         )
         .await

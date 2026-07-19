@@ -201,4 +201,3 @@ impl Reserver for SpaceLedger {
         state.committed_since = state.committed_since.saturating_add(bytes);
     }
 }
-

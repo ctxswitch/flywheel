@@ -1,42 +1,32 @@
 //! Manifest-driven prefetch for the cacheprog helper.
 //!
 //! A session remembers which objects the previous build with the same label used
-//! (the manifest, stored server-side under an ordinary build-cache key) and streams
-//! all of them down in one request while the build runs. Prefetch is pure
-//! prediction: every body is sha256-verified before it lands in the scratch
-//! directory, and anything missing falls back to a normal get, so correctness
-//! never depends on it.
+//! (the manifest, stored server-side under an ordinary build-cache key). At startup
+//! the helper asks its local agent `GET /status?session=<label>` for the merged
+//! manifest and warms the local object directory with bounded parallel cache GETs
+//! — exactly the requests a foreground miss would issue — while the build runs.
+//! Prefetch is pure prediction: every body is verified against the manifest before
+//! it lands in the scratch directory, and anything missing falls back to a normal
+//! get, so correctness never depends on it.
 
-use crate::prefetch::{FrameDecoder, FrameEncoding, PrefetchRequest};
-use serde::{Deserialize, Serialize};
+use crate::manifest::{
+    MANIFEST_MAX_AGE_SECONDS, MANIFEST_MAX_ENTRIES, MANIFEST_VERSION, Manifest, ManifestEntry,
+    REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH,
+};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
-use tokio::io::AsyncReadExt;
-use tokio_util::io::StreamReader;
+use tokio::{io::AsyncWriteExt, sync::watch};
 
-pub const MANIFEST_VERSION: u32 = 1;
-pub const MANIFEST_MAX_ENTRIES: usize = 32 * 1024;
-pub const MANIFEST_MAX_AGE_SECONDS: u64 = 14 * 24 * 60 * 60;
-const PREFETCH_TIMEOUT: Duration = Duration::from_secs(600);
 const FINALIZE_TIMEOUT: Duration = Duration::from_secs(15);
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
-pub struct Manifest {
-    pub version: u32,
-    pub entries: HashMap<String, ManifestEntry>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub struct ManifestEntry {
-    pub output: String,
-    pub size: u64,
-    pub last_seen: u64,
-}
 
 /// What this build actually touched: action hex → (output hex, logical size).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +40,10 @@ pub struct UsedEntry {
 pub struct SessionState {
     pub manifest: OnceLock<Manifest>,
     pub used: Mutex<HashMap<String, UsedEntry>>,
+    /// Outputs the prefetch pool is downloading right now. A foreground get for
+    /// one of these waits for the in-flight download instead of fetching the
+    /// same bytes a second time.
+    inflight: Mutex<HashMap<String, watch::Receiver<()>>>,
 }
 
 impl SessionState {
@@ -65,6 +59,51 @@ impl SessionState {
     /// prefetch task (or an earlier get) verified its digest before writing it.
     pub fn manifest_entry(&self, action: &str) -> Option<ManifestEntry> {
         self.manifest.get()?.entries.get(action).cloned()
+    }
+
+    /// Marks `output` as downloading for as long as the returned marker lives.
+    /// Success, failure, and cancellation all end in the same drop, so waiters
+    /// need no completion bookkeeping beyond its scope.
+    fn begin_download(&self, output: &str) -> InflightDownload<'_> {
+        let (sender, receiver) = watch::channel(());
+        self.inflight
+            .lock()
+            .expect("inflight map lock")
+            .insert(output.to_owned(), receiver);
+        InflightDownload {
+            session: self,
+            output: output.to_owned(),
+            _sender: sender,
+        }
+    }
+
+    /// The completion signal of an in-flight download of `output`, if any. The
+    /// signal resolves when the download ends, however it ends; the caller
+    /// rechecks the disk to learn whether it succeeded.
+    pub fn download_in_progress(&self, output: &str) -> Option<watch::Receiver<()>> {
+        self.inflight
+            .lock()
+            .expect("inflight map lock")
+            .get(output)
+            .cloned()
+    }
+}
+
+/// One download the pool currently has in flight: dropping it removes the map
+/// entry and then drops the sender, which wakes every waiter.
+struct InflightDownload<'a> {
+    session: &'a SessionState,
+    output: String,
+    _sender: watch::Sender<()>,
+}
+
+impl Drop for InflightDownload<'_> {
+    fn drop(&mut self) {
+        self.session
+            .inflight
+            .lock()
+            .expect("inflight map lock")
+            .remove(&self.output);
     }
 }
 
@@ -175,13 +214,6 @@ fn host_goarch() -> &'static str {
     }
 }
 
-pub fn manifest_key(label: &str) -> String {
-    format!(
-        "go-manifest-{}",
-        hex::encode(Sha256::digest(label.as_bytes()))
-    )
-}
-
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -189,15 +221,18 @@ pub fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// The startup task: fetch the manifest, then stream every predicted object down in
-/// one request. Any failure — endpoint missing on an older server, stream drop, bad
-/// frame — logs and stops; everything simply falls back to normal gets.
+/// The startup task: fetch the merged manifest from the local agent, then warm the
+/// object directory with bounded parallel cache GETs. Any failure — endpoint
+/// missing on an older server, a dropped connection, a body that fails
+/// verification — degrades to fewer warm objects; everything simply falls back to
+/// normal gets.
 pub async fn run_prefetch(
     client: reqwest::Client,
     base: reqwest::Url,
     token: Option<String>,
     directory: PathBuf,
-    manifest_key: String,
+    label: String,
+    concurrency: usize,
     state: Arc<SessionState>,
 ) {
     if let Err(error) = prefetch(
@@ -205,7 +240,8 @@ pub async fn run_prefetch(
         &base,
         token.as_deref(),
         &directory,
-        &manifest_key,
+        &label,
+        concurrency,
         &state,
     )
     .await
@@ -219,12 +255,24 @@ async fn prefetch(
     base: &reqwest::Url,
     token: Option<&str>,
     directory: &Path,
-    manifest_key: &str,
+    label: &str,
+    concurrency: usize,
     state: &SessionState,
 ) -> anyhow::Result<()> {
-    let Some(response) = super::send_get(client, base, token, manifest_key).await? else {
-        return Ok(());
-    };
+    let started = std::time::Instant::now();
+    let mut status_url = base.clone();
+    status_url.set_path("/status");
+    status_url.set_query(None);
+    let response = client
+        .get(status_url)
+        .query(&[("session", label)])
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "session status lookup returned {}",
+        response.status()
+    );
     let manifest: Manifest = serde_json::from_slice(&response.bytes().await?)?;
     anyhow::ensure!(
         manifest.version == MANIFEST_VERSION,
@@ -233,9 +281,11 @@ async fn prefetch(
     );
     let manifest = state.manifest.get_or_init(|| manifest);
 
+    // One download per distinct output: several actions can share one body.
     let mut seen = HashSet::new();
-    let mut digests = Vec::new();
-    for entry in manifest.entries.values() {
+    let mut wanted = Vec::new();
+    let mut local = 0usize;
+    for (action, entry) in &manifest.entries {
         if !seen.insert(entry.output.as_str()) {
             continue;
         }
@@ -244,54 +294,156 @@ async fn prefetch(
             // Still predicted, so keep it inside the pruning window even if this
             // build never asks for it.
             super::touch(&path);
+            local += 1;
             continue;
         }
-        digests.push(entry.output.clone());
+        wanted.push((action.as_str(), entry));
     }
-    if digests.is_empty() {
-        return Ok(());
-    }
+    let advertised = seen.len();
 
+    let limit = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let active = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let mut downloads: FuturesUnordered<_> = wanted
+        .iter()
+        .map(|&(action, entry)| {
+            let limit = Arc::clone(&limit);
+            let active = &active;
+            let peak = &peak;
+            async move {
+                let _permit = limit
+                    .acquire_owned()
+                    .await
+                    .expect("prefetch semaphore is never closed");
+                let running = active.fetch_add(1, Ordering::Relaxed) + 1;
+                peak.fetch_max(running, Ordering::Relaxed);
+                let outcome =
+                    download_object(client, base, token, directory, state, action, entry).await;
+                active.fetch_sub(1, Ordering::Relaxed);
+                match outcome {
+                    Ok(fetched) => Some(fetched),
+                    Err(error) => {
+                        // Every per-object failure is just a future foreground miss.
+                        tracing::debug!(%error, "prefetch download skipped");
+                        None
+                    }
+                }
+            }
+        })
+        .collect();
+    let attempted = downloads.len();
+    let mut downloaded = 0usize;
+    let mut bytes = 0u64;
+    let mut published_meanwhile = 0usize;
+    while let Some(result) = downloads.next().await {
+        match result {
+            Some(Fetched::Published(size)) => {
+                downloaded += 1;
+                bytes += size;
+            }
+            Some(Fetched::AlreadyLocal) => published_meanwhile += 1,
+            Some(Fetched::Miss) | None => {}
+        }
+    }
+    drop(downloads);
+    tracing::info!(
+        advertised,
+        local = local + published_meanwhile,
+        attempted,
+        downloaded,
+        missed = attempted - downloaded - published_meanwhile,
+        bytes,
+        duration_ms = started.elapsed().as_millis() as u64,
+        peak_concurrency = peak.load(Ordering::Relaxed),
+        "build-cache prefetch complete"
+    );
+    Ok(())
+}
+
+enum Fetched {
+    /// Downloaded, verified, and published, carrying the object size.
+    Published(u64),
+    /// A foreground get published the object while this download was queued.
+    AlreadyLocal,
+    /// The server does not hold the object.
+    Miss,
+}
+
+/// Downloads one predicted object through the ordinary cache route — the exact GET
+/// a foreground miss would issue, plus the telemetry purpose header — verifying
+/// size and digest against the manifest entry before publishing it into the local
+/// object directory.
+async fn download_object(
+    client: &reqwest::Client,
+    base: &reqwest::Url,
+    token: Option<&str>,
+    directory: &Path,
+    session: &SessionState,
+    action: &str,
+    entry: &ManifestEntry,
+) -> anyhow::Result<Fetched> {
+    // Register before the disk recheck so a concurrent foreground get sees either
+    // the finished file or the in-flight marker, never neither.
+    let _inflight = session.begin_download(&entry.output);
+    let path = directory.join(&entry.output);
+    // The work list was computed at startup; a foreground get may have published
+    // this object while the download waited behind the concurrency bound.
+    if super::file_has_size(&path, entry.size).await {
+        return Ok(Fetched::AlreadyLocal);
+    }
     let mut request = client
-        .post(base.join("../prefetch")?)
-        .timeout(PREFETCH_TIMEOUT)
-        .json(&PrefetchRequest { digests });
+        .get(base.join(&format!("go-{action}"))?)
+        .header(REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
     let response = request.send().await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Fetched::Miss);
+    }
     anyhow::ensure!(
         response.status().is_success(),
-        "prefetch returned {}",
+        "prefetch GET returned {}",
         response.status()
     );
-    let stream =
-        futures_util::TryStreamExt::map_err(response.bytes_stream(), std::io::Error::other);
-    let mut decoder = FrameDecoder::new(StreamReader::new(stream));
-    while let Some((header, body)) = decoder.next_frame().await? {
-        if header.miss {
-            continue;
-        }
-        let content = match header.encoding {
-            FrameEncoding::Zstd => {
-                let mut decoder =
-                    async_compression::tokio::bufread::ZstdDecoder::new(body.as_slice());
-                let mut content = Vec::new();
-                decoder.read_to_end(&mut content).await?;
-                content
-            }
-            FrameEncoding::Identity => body,
-        };
-        anyhow::ensure!(
-            content.len() as u64 == header.content_len,
-            "prefetched object size mismatch"
-        );
-        anyhow::ensure!(
-            hex::encode(Sha256::digest(&content)) == header.digest,
-            "prefetched object failed digest verification"
-        );
-        super::write_atomic(&directory.join(&header.digest), &content).await?;
+    let temporary = super::temporary_path(directory);
+    if let Err(error) = spool_verified(response, &temporary, entry).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
     }
+    if let Err(error) = tokio::fs::rename(&temporary, &path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        if !tokio::fs::try_exists(&path).await? {
+            return Err(error.into());
+        }
+    }
+    Ok(Fetched::Published(entry.size))
+}
+
+/// Streams the response body into the temporary file while hashing incrementally,
+/// then verifies size and digest against the manifest entry. The caller removes
+/// the temporary file on any error.
+async fn spool_verified(
+    response: reqwest::Response,
+    temporary: &Path,
+    entry: &ManifestEntry,
+) -> anyhow::Result<()> {
+    let mut file = tokio::fs::File::create(temporary).await?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        hasher.update(&chunk);
+        size += chunk.len() as u64;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    anyhow::ensure!(size == entry.size, "prefetched object size mismatch");
+    anyhow::ensure!(
+        hex::encode(hasher.finalize()) == entry.output,
+        "prefetched object failed digest verification"
+    );
     Ok(())
 }
 
