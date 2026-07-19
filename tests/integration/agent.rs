@@ -10,7 +10,6 @@ use flywheel::{
     },
     clock::SystemClock,
     config::Config,
-    manifest::{MANIFEST_VERSION, Manifest, ManifestEntry, manifest_key},
 };
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -571,163 +570,6 @@ async fn agents_with_divergent_membership_views_both_serve_safely() {
     }
 }
 
-fn manifest_of(entries: &[(&str, &str, u64)]) -> Manifest {
-    Manifest {
-        version: MANIFEST_VERSION,
-        entries: entries
-            .iter()
-            .map(|(action, output, last_seen)| {
-                (
-                    (*action).to_owned(),
-                    ManifestEntry {
-                        output: (*output).to_owned(),
-                        size: 1,
-                        last_seen: *last_seen,
-                    },
-                )
-            })
-            .collect(),
-    }
-}
-
-/// Stores a shard-local manifest generation the way cacheprog's finalize does:
-/// directly on one member, under the shared session key.
-async fn put_manifest(
-    client: &reqwest::Client,
-    backend: &Backend,
-    session: &str,
-    manifest: &Manifest,
-) {
-    let response = client
-        .put(format!(
-            "http://{}/build-cache/http/{}",
-            backend.address,
-            manifest_key(session)
-        ))
-        .body(serde_json::to_vec(manifest).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-}
-
-async fn merged_manifest(
-    client: &reqwest::Client,
-    harness: &AgentHarness,
-    session: &str,
-) -> Manifest {
-    let response = client
-        .get(format!("{}/status", harness.base))
-        .query(&[("session", session)])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    response.json().await.unwrap()
-}
-
-/// Ring membership drifted between builds, so different members hold different
-/// manifest generations. The sessioned status fan-out must query every member of
-/// the snapshot and merge per Go action by recency, while the bare status
-/// response stays the operational ring view.
-#[tokio::test]
-async fn sessioned_status_fans_out_to_all_members_and_merges_by_recency() {
-    let backends = [
-        Backend::spawn().await,
-        Backend::spawn().await,
-        Backend::spawn().await,
-    ];
-    let resolver = Arc::new(TestResolver::default());
-    resolver.set(all_members(&backends));
-    let harness = spawn_agent(Arc::clone(&resolver)).await;
-    let client = client();
-    // Spaces and slashes exercise the URL-encoded raw-label contract.
-    let session = "ci example.com/widget linux/amd64";
-
-    put_manifest(
-        &client,
-        &backends[0],
-        session,
-        &manifest_of(&[("shared", "aa", 10), ("only-first", "bb", 5)]),
-    )
-    .await;
-    put_manifest(
-        &client,
-        &backends[1],
-        session,
-        &manifest_of(&[("shared", "cc", 20), ("only-second", "dd", 7)]),
-    )
-    .await;
-
-    let merged = merged_manifest(&client, &harness, session).await;
-    assert_eq!(
-        merged,
-        manifest_of(&[
-            ("shared", "cc", 20),
-            ("only-first", "bb", 5),
-            ("only-second", "dd", 7),
-        ])
-    );
-
-    // The bare status response is the ring view, not a manifest.
-    let bare: serde_json::Value = client
-        .get(format!("{}/status", harness.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(bare["members"].as_array().unwrap().len(), 3);
-    assert!(bare["srv"].as_str().is_some());
-    assert!(bare.get("entries").is_none());
-}
-
-/// A dead member stays silent to cacheprog: the fan-out merges what the
-/// survivors answered.
-#[tokio::test]
-async fn sessioned_status_survives_member_failure_with_partial_results() {
-    let backends = [
-        Backend::spawn().await,
-        Backend::spawn().await,
-        Backend::spawn().await,
-    ];
-    let resolver = Arc::new(TestResolver::default());
-    resolver.set(all_members(&backends));
-    let harness = spawn_agent(Arc::clone(&resolver)).await;
-    let client = client();
-    let session = "partial-fanout";
-
-    put_manifest(
-        &client,
-        &backends[0],
-        session,
-        &manifest_of(&[("survives", "aa", 10)]),
-    )
-    .await;
-    put_manifest(
-        &client,
-        &backends[1],
-        session,
-        &manifest_of(&[("lost-with-member", "bb", 20)]),
-    )
-    .await;
-    backends[1].kill().await;
-
-    let merged = merged_manifest(&client, &harness, session).await;
-    assert_eq!(merged, manifest_of(&[("survives", "aa", 10)]));
-}
-
-#[tokio::test]
-async fn sessioned_status_returns_an_empty_manifest_on_an_empty_ring() {
-    let resolver = Arc::new(TestResolver::default());
-    let harness = spawn_agent(resolver).await;
-    let client = client();
-
-    let merged = merged_manifest(&client, &harness, "anything").await;
-    assert_eq!(merged, Manifest::empty());
-}
-
 /// Response headers prove that an ordinary send reached the member. The success must
 /// reset a prior connect-failure streak even when the caller never consumes the body,
 /// so the next connect failure starts a new streak instead of ejecting the member.
@@ -784,37 +626,6 @@ async fn successful_headers_reset_forward_failure_streak_before_body_consumption
 
     drop(successful);
     backend_task.abort();
-}
-
-/// The sessioned status fan-out uses the same send-time health rule as ordinary
-/// forwards: response headers from a member reset its failure streak, so a
-/// successful fan-out answer heals a prior connect failure before the next one.
-#[tokio::test]
-async fn successful_fanout_headers_reset_failure_streak() {
-    let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_address = unused.local_addr().unwrap();
-    drop(unused);
-    let member_id = "flywheel-0.shards.test.svc".to_owned();
-    let resolver = Arc::new(TestResolver::default());
-    resolver.set(vec![(member_id.clone(), dead_address)]);
-    let harness = spawn_agent_with_failure_limit(Arc::clone(&resolver), 2).await;
-    let client = client();
-
-    merged_manifest(&client, &harness, "streak-probe").await;
-    assert_eq!(member_status(&client, &harness).await["failures"], 1);
-
-    let backend = Backend::spawn().await;
-    resolver.set(vec![(member_id.clone(), backend.address)]);
-    harness.agent.refresh_once().await.unwrap();
-    merged_manifest(&client, &harness, "streak-probe").await;
-    assert_eq!(member_status(&client, &harness).await["failures"], 0);
-
-    resolver.set(vec![(member_id, dead_address)]);
-    harness.agent.refresh_once().await.unwrap();
-    merged_manifest(&client, &harness, "streak-probe").await;
-    let status = member_status(&client, &harness).await;
-    assert_eq!(status["failures"], 1);
-    assert_eq!(status["ejected"], false);
 }
 
 /// A backend that returns 200 and then dies mid-body must surface the truncation

@@ -2,17 +2,23 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flywheel::{
-    Flywheel,
-    config::Config,
-    manifest::{MANIFEST_VERSION, Manifest, ManifestEntry, manifest_key},
+    Flywheel, cacheprog::run_with_io, cli::CacheprogArgs, config::Config, manifest::manifest_key,
 };
 use futures_util::stream;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tempfile::TempDir;
-use tokio::sync::Notify;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::Notify,
+};
 use tower::ServiceExt;
 
 async fn call(app: axum::Router, request: Request<Body>) -> axum::response::Response {
@@ -350,85 +356,202 @@ async fn empty_compressed_bodies_ignore_ranges_with_ordinary_negotiation() {
     );
 }
 
+/// Two builds of one session against a real server over TCP: the first
+/// populates the cache and finalizes the manifest, the second bootstraps from
+/// one plain manifest-key GET, synthesizes the empty object locally, and
+/// downloads each distinct nonzero output at most once — never once per action.
 #[tokio::test]
-async fn status_returns_the_locally_stored_manifest_for_a_session() {
+async fn warm_build_costs_one_manifest_get_plus_one_get_per_distinct_output() {
+    fn put_line(id: u32, action: &[u8], body: &[u8]) -> String {
+        let mut line = format!(
+            "{{\"ID\":{id},\"Command\":\"put\",\"ActionID\":\"{}\",\"OutputID\":\"{}\",\"BodySize\":{}}}\n",
+            STANDARD.encode(action),
+            STANDARD.encode(Sha256::digest(body)),
+            body.len(),
+        );
+        if !body.is_empty() {
+            line.push_str(&format!("\"{}\"\n", STANDARD.encode(body)));
+        }
+        line
+    }
+
     let directory = TempDir::new().unwrap();
-    let app = Flywheel::open(Config::new(directory.path()))
-        .await
-        .unwrap()
-        .router();
-    let manifest = Manifest {
-        version: MANIFEST_VERSION,
-        entries: std::collections::HashMap::from([(
-            "aa".repeat(32),
-            ManifestEntry {
-                output: "bb".repeat(32),
-                size: 42,
-                last_seen: 7,
-            },
-        )]),
+    let flywheel = Flywheel::open(Config::new(directory.path())).await.unwrap();
+    let requests: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let router = flywheel.router().layer(axum::middleware::from_fn({
+        let requests = Arc::clone(&requests);
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let requests = Arc::clone(&requests);
+            async move {
+                requests.lock().unwrap().push((
+                    request.method().to_string(),
+                    request.uri().path().to_owned(),
+                ));
+                next.run(request).await
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let session = "e2e integration/widget linux/amd64";
+    let args = |cache_dir: &std::path::Path| CacheprogArgs {
+        url: format!("http://{address}/build-cache/http/"),
+        token: None,
+        cache_dir: Some(cache_dir.into()),
+        ephemeral_cache: false,
+        session: Some(session.into()),
+        prune_days: 14,
+        prefetch_concurrency: 4,
     };
-    // The manifest is stored through the ordinary build-cache route under the
-    // shared key derivation, exactly as cacheprog's finalize writes it.
+
+    // One shared empty output under several actions, plus three distinct
+    // nonzero bodies, one of them produced by two different actions.
+    let zero_actions: Vec<Vec<u8>> = (1u8..=3).map(|n| vec![0, n]).collect();
+    let sized: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        (vec![1, 1], b"first shared body".to_vec()),
+        (vec![1, 2], b"first shared body".to_vec()),
+        (vec![2, 1], b"second body".to_vec()),
+        (vec![3, 1], b"third body".to_vec()),
+    ];
+
+    // Build 1 populates: a put per action, close writes the manifest.
+    let mut input = String::new();
+    let mut id = 1u32;
+    for action in &zero_actions {
+        input.push_str(&put_line(id, action, b""));
+        id += 1;
+    }
+    for (action, body) in &sized {
+        input.push_str(&put_line(id, action, body));
+        id += 1;
+    }
+    input.push_str(&format!("{{\"ID\":{id},\"Command\":\"close\"}}\n"));
+    let build_one_dir = TempDir::new().unwrap();
+    let mut output = Vec::new();
+    run_with_io(
+        args(build_one_dir.path()),
+        BufReader::new(input.as_bytes()),
+        &mut output,
+    )
+    .await
+    .unwrap();
+    for line in String::from_utf8(output).unwrap().lines() {
+        let response: Value = serde_json::from_str(line).unwrap();
+        assert!(response.get("Err").is_none(), "build 1 failed: {response}");
+    }
+
+    // Build 2 starts locally cold: everything it knows must come from the
+    // manifest bootstrap.
+    let populate_requests = requests.lock().unwrap().len();
+    let build_two_dir = TempDir::new().unwrap();
+    let (mut input, cache_input) = tokio::io::duplex(64 * 1024);
+    let (cache_output, output) = tokio::io::duplex(64 * 1024);
+    let cache = tokio::spawn(run_with_io(
+        args(build_two_dir.path()),
+        BufReader::new(cache_input),
+        cache_output,
+    ));
+
+    // The bootstrap runs unprompted: one manifest GET plus one GET per distinct
+    // nonzero output, with the empty object elided.
+    let manifest_path = format!("/build-cache/http/{}", manifest_key(session));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let warm = requests.lock().unwrap()[populate_requests..].to_vec();
+        if warm.len() >= 4 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "prefetch stalled: {warm:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Foreground gets for every action — zero and nonzero — answer locally.
+    let all_actions: Vec<&[u8]> = zero_actions
+        .iter()
+        .map(Vec::as_slice)
+        .chain(sized.iter().map(|(action, _)| action.as_slice()))
+        .collect();
+    let mut warm_input = String::new();
+    for (index, action) in all_actions.iter().enumerate() {
+        warm_input.push_str(&format!(
+            "{{\"ID\":{},\"Command\":\"get\",\"ActionID\":\"{}\"}}\n",
+            100 + index,
+            STANDARD.encode(action)
+        ));
+    }
+    warm_input.push_str("{\"ID\":999,\"Command\":\"close\"}\n");
+    input.write_all(warm_input.as_bytes()).await.unwrap();
+    let mut output = BufReader::new(output);
+    let mut responses = std::collections::HashMap::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        output.read_line(&mut line).await.unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        let id = response["ID"].as_u64().unwrap();
+        responses.insert(id, response);
+        if id == 999 {
+            break;
+        }
+    }
+    drop(input);
+    cache.await.unwrap().unwrap();
+    server.abort();
+
+    let empty_output = STANDARD.encode(Sha256::digest(b""));
+    for (index, action) in all_actions.iter().enumerate() {
+        let response = &responses[&(100 + index as u64)];
+        assert!(
+            response.get("Miss").is_none(),
+            "warm get missed: {response}"
+        );
+        let expected = if index < zero_actions.len() {
+            empty_output.clone()
+        } else {
+            let (_, body) = &sized[index - zero_actions.len()];
+            STANDARD.encode(Sha256::digest(body))
+        };
+        assert_eq!(
+            response["OutputID"].as_str().unwrap(),
+            expected,
+            "{action:?}"
+        );
+    }
+
+    // The complete warm-build request set: one manifest GET, no request for any
+    // zero-size action, one GET per distinct nonzero output, nothing repeated.
+    let warm = requests.lock().unwrap()[populate_requests..].to_vec();
+    assert_eq!(warm.len(), 4, "exactly the bootstrap traffic: {warm:?}");
     assert_eq!(
-        call(
-            app.clone(),
-            Request::put(format!(
-                "/build-cache/http/{}",
-                manifest_key("ci example.com/widget linux/amd64")
-            ))
-            .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
-            .unwrap(),
-        )
-        .await
-        .status(),
-        StatusCode::OK
+        warm.iter()
+            .filter(|(method, path)| method == "GET" && path == &manifest_path)
+            .count(),
+        1,
+        "warm requests: {warm:?}"
     );
-
-    let response = call(
-        app,
-        Request::get("/status?session=ci%20example.com%2Fwidget%20linux%2Famd64")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let returned: Manifest =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(returned, manifest);
-}
-
-#[tokio::test]
-async fn status_degrades_unknown_sessions_to_an_empty_manifest() {
-    let directory = TempDir::new().unwrap();
-    let app = Flywheel::open(Config::new(directory.path()))
-        .await
-        .unwrap()
-        .router();
-
-    let response = call(
-        app,
-        Request::get("/status?session=never-built")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let returned: Manifest =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(returned, Manifest::empty());
-}
-
-#[tokio::test]
-async fn status_requires_the_session_parameter() {
-    let directory = TempDir::new().unwrap();
-    let app = Flywheel::open(Config::new(directory.path()))
-        .await
-        .unwrap()
-        .router();
-
-    let response = call(app, Request::get("/status").body(Body::empty()).unwrap()).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    for action in &zero_actions {
+        let path = format!("/build-cache/http/go-{}", hex::encode(action));
+        assert!(
+            !warm.iter().any(|(_, requested)| requested == &path),
+            "zero-size action fetched: {warm:?}"
+        );
+    }
+    let mut object_paths: Vec<&String> = warm
+        .iter()
+        .filter(|(_, path)| path != &manifest_path)
+        .map(|(_, path)| path)
+        .collect();
+    object_paths.sort();
+    object_paths.dedup();
+    assert_eq!(
+        object_paths.len(),
+        3,
+        "one GET per distinct nonzero output: {warm:?}"
+    );
 }
 
 #[tokio::test]

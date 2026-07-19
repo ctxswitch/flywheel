@@ -4,7 +4,6 @@ use flywheel::{
     channel::{ChannelId, ChannelToken},
     manifest::{
         MANIFEST_MAX_AGE_SECONDS, MANIFEST_MAX_ENTRIES, MANIFEST_VERSION, Manifest, ManifestEntry,
-        merge_manifests,
     },
     reference::Reference,
 };
@@ -129,61 +128,6 @@ fn manifest_merge_caps_size_by_evicting_the_oldest() {
     for index in 0..5 {
         assert!(!merged.entries.contains_key(&format!("action-{index}")));
     }
-}
-
-#[test]
-fn merge_manifests_unions_shard_answers_by_recency() {
-    let older = Manifest {
-        version: MANIFEST_VERSION,
-        entries: HashMap::from([
-            ("shared".to_owned(), manifest_entry("aa", 10)),
-            ("only-older".to_owned(), manifest_entry("bb", 5)),
-        ]),
-    };
-    let newer = Manifest {
-        version: MANIFEST_VERSION,
-        entries: HashMap::from([
-            ("shared".to_owned(), manifest_entry("cc", 20)),
-            ("only-newer".to_owned(), manifest_entry("dd", 7)),
-        ]),
-    };
-
-    // Order must not matter: recency decides the shared action either way.
-    for manifests in [
-        vec![older.clone(), newer.clone()],
-        vec![newer.clone(), older.clone()],
-    ] {
-        let merged = merge_manifests(manifests);
-        assert_eq!(merged.version, MANIFEST_VERSION);
-        assert_eq!(merged.entries.len(), 3);
-        assert_eq!(merged.entries["shared"], manifest_entry("cc", 20));
-        assert_eq!(merged.entries["only-older"], manifest_entry("bb", 5));
-        assert_eq!(merged.entries["only-newer"], manifest_entry("dd", 7));
-    }
-}
-
-#[test]
-fn merge_manifests_ties_keep_the_first_answer_and_ignore_unknown_versions() {
-    let first = Manifest {
-        version: MANIFEST_VERSION,
-        entries: HashMap::from([("tied".to_owned(), manifest_entry("aa", 10))]),
-    };
-    let second = Manifest {
-        version: MANIFEST_VERSION,
-        entries: HashMap::from([("tied".to_owned(), manifest_entry("bb", 10))]),
-    };
-    let merged = merge_manifests([first, second]);
-    assert_eq!(merged.entries["tied"], manifest_entry("aa", 10));
-
-    // A version-mismatched shard answer contributes nothing.
-    let unknown = Manifest {
-        version: MANIFEST_VERSION + 1,
-        entries: HashMap::from([("tied".to_owned(), manifest_entry("cc", 99))]),
-    };
-    let merged = merge_manifests([merged, unknown]);
-    assert_eq!(merged.entries["tied"], manifest_entry("aa", 10));
-
-    assert_eq!(merge_manifests(Vec::new()), Manifest::empty());
 }
 
 #[test]

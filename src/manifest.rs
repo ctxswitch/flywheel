@@ -1,11 +1,12 @@
-//! The session manifest: the prefetch vocabulary shared by the cacheprog helper,
-//! the shard HTTP service, and the routing agent.
+//! The session manifest: the prefetch vocabulary shared by the cacheprog helper
+//! and the shard HTTP service.
 //!
 //! A manifest remembers which Go actions the previous build with the same session
 //! label used. It is stored server-side under an ordinary build-cache key derived
-//! from the label, so its lifecycle is plain cache traffic. Shards answer
-//! `GET /status?session=` with whatever manifest they hold locally, and the agent
-//! merges those per-shard answers into one view with [`merge_manifests`].
+//! from the label, so its whole lifecycle — discovery included — is plain cache
+//! traffic: the helper GETs the key at startup, and its close merges usage back
+//! with a GET and a PUT of the same key. Only the latest copy matters; a lost
+//! manifest just makes the next build run cold before finalize rehydrates it.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -22,7 +23,7 @@ pub const REQUEST_PURPOSE_HEADER: &str = "x-flywheel-request-purpose";
 pub const REQUEST_PURPOSE_PREFETCH: &str = "prefetch";
 pub const REQUEST_PREFETCH_CONCURRENCY_HEADER: &str = "x-flywheel-prefetch-concurrency";
 /// Telemetry-only correlation label attached to prefetch object requests. The
-/// value is the same session label used for manifest discovery and never affects
+/// value is the manifest key of the session being prefetched and never affects
 /// routing or cache identity.
 pub const REQUEST_SESSION_HEADER: &str = "x-flywheel-session";
 
@@ -58,25 +59,4 @@ pub fn manifest_key(label: &str) -> String {
         "go-manifest-{}",
         hex::encode(Sha256::digest(label.as_bytes()))
     )
-}
-
-/// Merges shard-local manifests into one view: union per Go action, and where
-/// shards disagree the most recently seen entry wins — the same recency rule the
-/// session merge uses. A version-mismatched input contributes nothing.
-pub fn merge_manifests(manifests: impl IntoIterator<Item = Manifest>) -> Manifest {
-    let mut merged = Manifest::empty();
-    for manifest in manifests {
-        if manifest.version != MANIFEST_VERSION {
-            continue;
-        }
-        for (action, entry) in manifest.entries {
-            match merged.entries.get(&action) {
-                Some(existing) if existing.last_seen >= entry.last_seen => {}
-                _ => {
-                    merged.entries.insert(action, entry);
-                }
-            }
-        }
-    }
-    merged
 }

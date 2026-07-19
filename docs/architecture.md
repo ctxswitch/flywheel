@@ -318,22 +318,24 @@ body when used in the same channel.
 
 The `cacheprog` client warms its local object directory before Go asks, as an optimization
 for Go's `GOCACHEPROG` protocol. Prefetch is ordinary cache traffic issued early and in
-parallel, not a separate protocol. Discovery goes through the agent: cacheprog sends
-`GET /status?session=<label>` to its pod-local agent, the agent sends the same request to
-every member of one ring snapshot concurrently, each shard answers with the session
-manifest it holds locally, and the agent merges the answers per Go action by recency.
-Shards answer the same route directly for single-replica deployments. Cacheprog then
-issues one ordinary `GET /build-cache/http/go-<action>` per predicted object from a
-bounded worker pool; the agent routes each GET to its ring owner like any foreground
-request. A foreground get for an object the pool is mid-download waits for that download
-rather than repeating it, and a queued download that finds its object already on disk
-skips the fetch, so each object crosses the network once per session. Speculative GETs carry a telemetry-only request-purpose header so the agent can
-count them separately; the header changes nothing else.
+parallel, not a separate protocol. Discovery is one such request: the session manifest
+lives under a build-cache key derived from the session label, so cacheprog bootstraps with
+a plain `GET /build-cache/http/go-manifest-<hash>` — the same request its close-time
+manifest update issues — and the routing layer sends it to the key's ring owner like any
+other. The authoritative copy is whatever the route serves; a lost manifest just means one
+cold build before the next close rehydrates it. Cacheprog then issues one ordinary
+`GET /build-cache/http/go-<action>` per distinct predicted output from a bounded worker
+pool. Zero-size outputs never touch the network: every zero-size action shares the one
+empty object, which cacheprog synthesizes locally. A foreground get for an object the
+pool has queued or is mid-download waits for that download rather than repeating it, and
+a queued download that finds its object already on disk skips the fetch, so each object
+crosses the network at most once per session. Speculative GETs carry a telemetry-only
+request-purpose header so the agent can count them separately; the header changes nothing
+else.
 
 Every prefetched body is verified against the manifest before it enters the helper's local
-cache, and every failure — empty ring, partial fan-out, missing or invalid manifest,
-failed download — degrades to fewer warm objects. Correctness never depends on the
-prediction or manifest.
+cache, and every failure — empty ring, missing or invalid manifest, failed download —
+degrades to fewer warm objects. Correctness never depends on the prediction or manifest.
 
 ## Package proxy
 

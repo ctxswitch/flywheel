@@ -185,7 +185,8 @@ pub struct CacheprogArgs {
         default_value_t = crate::manifest::MANIFEST_MAX_AGE_SECONDS / (24 * 60 * 60)
     )]
     pub prune_days: u64,
-    /// Bound on concurrent prefetch downloads; 0 disables prefetch entirely.
+    /// Bound on concurrent prefetch downloads; 0 disables the downloads while
+    /// keeping the single manifest fetch that answers known actions locally.
     #[arg(
         long,
         env = "FLYWHEEL_CACHEPROG_PREFETCH_CONCURRENCY",

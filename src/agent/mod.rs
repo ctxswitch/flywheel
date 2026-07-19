@@ -19,27 +19,27 @@ mod ring_test;
 use crate::{
     clock::Clock,
     manifest::{
-        Manifest, REQUEST_PREFETCH_CONCURRENCY_HEADER, REQUEST_PURPOSE_HEADER,
-        REQUEST_PURPOSE_PREFETCH, REQUEST_SESSION_HEADER, manifest_key, merge_manifests,
+        REQUEST_PREFETCH_CONCURRENCY_HEADER, REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH,
+        REQUEST_SESSION_HEADER,
     },
     telemetry::{MakeRequestUlid, REQUEST_ID_HEADER},
 };
 use axum::{
     Json, Router,
     body::Body,
-    extract::{MatchedPath, Query, Request, State},
-    http::{HeaderMap, Method, StatusCode},
+    extract::{MatchedPath, Request, State},
+    http::{Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
 use discovery::{Resolver, RingState, RingStatus};
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::StreamExt;
 use prometheus::{
     Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry, TextEncoder,
     core::Collector,
 };
 use ring::RingMember;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -612,126 +612,14 @@ struct AgentStatus {
     ring: RingStatus,
 }
 
-#[derive(Deserialize)]
-struct StatusQuery {
-    session: Option<String>,
-}
-
-/// Without `?session=`, the operational ring response, unchanged. With a session,
-/// prefetch manifest discovery: the merged manifest for that session label, and
-/// never members, addresses, or completeness — the agent stays the topology
-/// boundary.
-async fn status(
-    State(state): State<Arc<AgentState>>,
-    headers: HeaderMap,
-    Query(query): Query<StatusQuery>,
-) -> Response {
-    let configured_concurrency = headers
-        .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
-    match query.session.as_deref() {
-        Some(session) => {
-            Json(merged_session_manifest(&state, session, configured_concurrency).await)
-                .into_response()
-        }
-        None => Json(AgentStatus {
-            srv: state.options.srv.clone(),
-            ring: state.ring.status(),
-        })
-        .into_response(),
-    }
-}
-
-/// Fans the session lookup out to every member of one ring snapshot concurrently
-/// and merges the answers by recency. Failed members contribute nothing — an
-/// empty ring or a total failure is simply an empty manifest. Runs inside the
-/// handler future, so a client disconnect cancels the outstanding subrequests.
-async fn merged_session_manifest(
-    state: &Arc<AgentState>,
-    session: &str,
-    configured_concurrency: Option<usize>,
-) -> Manifest {
-    let started = Instant::now();
-    let session_id = manifest_key(session);
-    state.metrics.status_fanout_requests.inc();
-    let _in_flight = InFlightGauge::start(&state.metrics.status_fanout_in_flight);
-    let _duration = state.metrics.status_fanout_duration.start_timer();
-    let members = state.ring.ring().members().to_vec();
-    state
-        .metrics
-        .status_fanout_members_queried
-        .inc_by(members.len() as u64);
-    let mut pending: FuturesUnordered<_> = members
-        .iter()
-        .map(|member| async move { (member, member_manifest(state, member, session).await) })
-        .collect();
-    let mut manifests = Vec::new();
-    let mut failed = 0u64;
-    while let Some((member, outcome)) = pending.next().await {
-        match outcome {
-            Ok(manifest) => manifests.push(manifest),
-            Err(error) => {
-                failed += 1;
-                tracing::warn!(%error, member = member.id, "status fan-out member failed");
-            }
-        }
-    }
-    drop(pending);
-    let succeeded = members.len() as u64 - failed;
-    let merged = merge_manifests(manifests);
-    state
-        .metrics
-        .status_fanout_members_succeeded
-        .inc_by(succeeded);
-    state.metrics.status_fanout_members_failed.inc_by(failed);
-    state
-        .metrics
-        .status_fanout_manifest_entries
-        .observe(merged.entries.len() as f64);
-    tracing::info!(
-        members = members.len(),
-        succeeded,
-        failed,
-        entries = merged.entries.len(),
-        %session_id,
-        configured_concurrency,
-        duration_ms = started.elapsed().as_millis() as u64,
-        "session status fan-out complete"
-    );
-    merged
-}
-
-/// One member's local manifest. Transport failures feed the same ring health
-/// accounting as ordinary forwards; a non-200 or unparseable answer counts
-/// against the fan-out but not against the member's ejection streak.
-async fn member_manifest(
-    state: &AgentState,
-    member: &RingMember,
-    session: &str,
-) -> anyhow::Result<Manifest> {
-    let outcome = state
-        .client
-        .get(format!("http://{}/status", member.address))
-        .query(&[("session", session)])
-        .send()
-        .await;
-    let response = match outcome {
-        Ok(response) => {
-            state.ring.record_success(&member.id);
-            response
-        }
-        Err(error) => {
-            record_send_failure(state, member, &error);
-            return Err(error.into());
-        }
-    };
-    anyhow::ensure!(
-        response.status().is_success(),
-        "member status returned {}",
-        response.status()
-    );
-    Ok(serde_json::from_slice(&response.bytes().await?)?)
+/// The operational ring view: SRV name, fingerprint, and members. Never routes,
+/// addresses, or manifests — the agent stays the topology boundary.
+async fn status(State(state): State<Arc<AgentState>>) -> Response {
+    Json(AgentStatus {
+        srv: state.options.srv.clone(),
+        ring: state.ring.status(),
+    })
+    .into_response()
 }
 
 async fn metrics(State(state): State<Arc<AgentState>>) -> Response {
@@ -764,13 +652,6 @@ struct AgentMetrics {
     synthesized_bypasses: IntCounter,
     unavailable: IntCounter,
     ejections: IntCounter,
-    status_fanout_requests: IntCounter,
-    status_fanout_in_flight: IntGauge,
-    status_fanout_duration: Histogram,
-    status_fanout_members_queried: IntCounter,
-    status_fanout_members_succeeded: IntCounter,
-    status_fanout_members_failed: IntCounter,
-    status_fanout_manifest_entries: Histogram,
     prefetch_requests: IntCounter,
     prefetch_hits: IntCounter,
     prefetch_misses: IntCounter,
@@ -827,43 +708,6 @@ impl AgentMetrics {
             &registry,
             "ejections_total",
             "Shard ejections from the routing ring.",
-        )?;
-        let status_fanout_requests = agent_counter(
-            &registry,
-            "status_fanout_requests_total",
-            "Session manifest fan-out requests.",
-        )?;
-        let status_fanout_in_flight = agent_gauge(
-            &registry,
-            "status_fanout_in_flight",
-            "Session manifest fan-outs currently running.",
-        )?;
-        let status_fanout_duration = agent_histogram(
-            &registry,
-            "status_fanout_duration_seconds",
-            "Session manifest fan-out latency.",
-            request_buckets(),
-        )?;
-        let status_fanout_members_queried = agent_counter(
-            &registry,
-            "status_fanout_members_queried_total",
-            "Shard status requests attempted by fan-out.",
-        )?;
-        let status_fanout_members_succeeded = agent_counter(
-            &registry,
-            "status_fanout_members_succeeded_total",
-            "Shard status requests successfully merged.",
-        )?;
-        let status_fanout_members_failed = agent_counter(
-            &registry,
-            "status_fanout_members_failed_total",
-            "Shard status requests omitted after failure.",
-        )?;
-        let status_fanout_manifest_entries = agent_histogram(
-            &registry,
-            "status_fanout_manifest_entries",
-            "Entries returned by merged session manifests.",
-            vec![0.0, 1.0, 10.0, 100.0, 1_000.0, 10_000.0, 32_768.0],
         )?;
         let prefetch_requests = agent_counter(
             &registry,
@@ -932,13 +776,6 @@ impl AgentMetrics {
             synthesized_bypasses,
             unavailable,
             ejections,
-            status_fanout_requests,
-            status_fanout_in_flight,
-            status_fanout_duration,
-            status_fanout_members_queried,
-            status_fanout_members_succeeded,
-            status_fanout_members_failed,
-            status_fanout_manifest_entries,
             prefetch_requests,
             prefetch_hits,
             prefetch_misses,
@@ -959,21 +796,6 @@ impl AgentMetrics {
         let mut body = Vec::new();
         TextEncoder::new().encode(&self.registry.gather(), &mut body)?;
         Ok(body)
-    }
-}
-
-struct InFlightGauge<'a>(&'a IntGauge);
-
-impl<'a> InFlightGauge<'a> {
-    fn start(gauge: &'a IntGauge) -> Self {
-        gauge.inc();
-        Self(gauge)
-    }
-}
-
-impl Drop for InFlightGauge<'_> {
-    fn drop(&mut self) {
-        self.0.dec();
     }
 }
 

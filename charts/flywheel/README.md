@@ -79,8 +79,8 @@ helm upgrade --install flywheel charts/flywheel \
 Configure each sidecar with the chart's SRV name and point its workload at
 `http://127.0.0.1:9080`. A pod-local agent still uses bare Default Channel routes. This is
 the required topology for `flywheel cacheprog` prefetch against replicated shards: the
-sidecar merges the session manifest across shards through its `/status?session=` fan-out
-and routes each parallel prefetch download to the shard that owns it. See the
+session-manifest GET and each parallel prefetch download are ordinary cache requests the
+sidecar routes to the shard that owns them. See the
 [operations guide](../../docs/operations.md#pod-local-agent-sidecar) for a complete Pod
 fragment and rollout checks. The recommended native sidecar lifecycle is stable in
 Kubernetes 1.33; Kubernetes 1.32 clusters can use the regular multi-container form with an

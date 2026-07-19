@@ -7,6 +7,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -121,13 +122,35 @@ where
 pub async fn run(args: CacheprogArgs) -> anyhow::Result<()> {
     let reader = BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
-    run_with_io(args, reader, writer).await
+    run_with_shutdown(args, reader, writer, async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::debug!(%error, "shutdown signal failed");
+        }
+        tracing::debug!(component = "cacheprog", "shutdown requested");
+    })
+    .await
 }
 
-async fn run_with_io<R, W>(args: CacheprogArgs, reader: R, mut writer: W) -> anyhow::Result<()>
+/// The protocol loop over arbitrary IO: `run` binds it to stdio; integration
+/// tests drive it through in-memory pipes.
+pub async fn run_with_io<R, W>(args: CacheprogArgs, reader: R, mut writer: W) -> anyhow::Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
+{
+    run_with_shutdown(args, reader, &mut writer, std::future::pending()).await
+}
+
+async fn run_with_shutdown<R, W, S>(
+    args: CacheprogArgs,
+    reader: R,
+    mut writer: W,
+    shutdown: S,
+) -> anyhow::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+    S: Future<Output = ()>,
 {
     let base = reqwest::Url::parse(&args.url)?;
     anyhow::ensure!(
@@ -145,19 +168,17 @@ where
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
     let manifest_key = crate::manifest::manifest_key(&label);
-    // Concurrency 0 disables prefetch entirely; the manifest lifecycle (fetch on
-    // demand, merge-and-PUT at close) is untouched either way.
-    let mut prefetch_task = (args.prefetch_concurrency > 0).then(|| {
-        tokio::spawn(session::run_prefetch(
-            client.clone(),
-            base.clone(),
-            args.token.clone(),
-            directory.clone(),
-            label,
-            args.prefetch_concurrency,
-            Arc::clone(&session_state),
-        ))
-    });
+    // Always fetch the manifest — one GET that powers zero-elision and local
+    // answering. Concurrency 0 disables only the parallel object downloads.
+    let mut prefetch_task = Some(tokio::spawn(session::run_prefetch(
+        client.clone(),
+        base.clone(),
+        args.token.clone(),
+        directory.clone(),
+        manifest_key.clone(),
+        args.prefetch_concurrency,
+        Arc::clone(&session_state),
+    )));
     let mut session_finished = false;
 
     write_response(
@@ -172,11 +193,13 @@ where
     enum Event {
         Input(Option<ProtocolMessage>),
         Response(Response),
+        Shutdown,
     }
 
     let mut reader = ProtocolReader::new(reader);
     let mut in_flight = FuturesUnordered::new();
     let mut close_id = None;
+    tokio::pin!(shutdown);
     loop {
         if let Some(id) = close_id
             && in_flight.is_empty()
@@ -203,29 +226,34 @@ where
         }
 
         let event = if close_id.is_some() {
-            Event::Response(
-                in_flight
-                    .next()
-                    .await
-                    .expect("in-flight request was checked"),
-            )
+            tokio::select! {
+                biased;
+                () = &mut shutdown => Event::Shutdown,
+                response = in_flight.next() => Event::Response(
+                    response.expect("in-flight request was checked")
+                ),
+            }
         } else if in_flight.is_empty() {
-            Event::Input(reader.next_message().await?)
+            tokio::select! {
+                biased;
+                () = &mut shutdown => Event::Shutdown,
+                message = reader.next_message() => Event::Input(message?),
+            }
         } else {
             tokio::select! {
+                biased;
+                () = &mut shutdown => Event::Shutdown,
                 message = reader.next_message() => Event::Input(message?),
                 response = in_flight.next() => {
                     Event::Response(response.expect("in-flight request was checked"))
-                }
+                },
             }
         };
 
         match event {
             Event::Response(response) => write_response(&mut writer, &response).await?,
-            Event::Input(None) => {
-                while let Some(response) = in_flight.next().await {
-                    write_response(&mut writer, &response).await?;
-                }
+            Event::Input(None) | Event::Shutdown => {
+                in_flight.clear();
                 break;
             }
             Event::Input(Some(ProtocolMessage::Invalid(error))) => {

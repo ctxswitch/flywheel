@@ -37,10 +37,10 @@ RUST_LOG=info flywheel serve \
 ```
 
 The server and agent write structured JSON logs to stdout at `info` level by default.
-`RUST_LOG` overrides the filter. The `cacheprog` subcommand writes diagnostics to stderr
-because stdout carries its protocol with the Go tool. Prefetch status logs include the
-session, configured download concurrency, manifest size, and lookup duration. Per-object
-transfer details are available at `debug`.
+`RUST_LOG` overrides the filter. The `cacheprog` subcommand's diagnostics are all at
+`debug` and go to stderr because stdout carries its protocol with the Go tool. Its
+per-session prefetch summary includes advertised, local, attempted, downloaded, and missed
+objects, bytes, duration, and peak download concurrency.
 
 At `debug`, every server and agent request emits one completion record with these stable
 fields:
@@ -59,7 +59,7 @@ The request ID is returned in the response. An agent preserves it while forwardi
 selected ring member, so both processes can be queried with the same value. Access logs do not
 include authorization headers, query strings, or response bodies. Server failures emit an
 additional `error`-level record. The default `info` level
-retains startup, shutdown, maintenance reclamation, ring changes, status fan-out summaries,
+retains startup, shutdown, maintenance reclamation, ring changes,
 and cacheprog's aggregate prefetch result without emitting records for every cache object.
 
 Pass `--debug` to enable Flywheel debug events and per-request completion logs. For finer
@@ -185,18 +185,17 @@ The route families are:
 Only canonical lowercase SHA-256 digests are supported for artifact identities. Reference
 names and build-cache keys must be URL-safe.
 
-One root route exists outside the channel tree: `GET /status?session=<label>` returns the
-`cacheprog` session manifest a replica holds locally in the Default Channel, always as
-`200` JSON, degrading to an empty manifest when the session is unknown or the stored body
-is unreadable. A missing `session` parameter is a `400`. The routing agent serves the same
-route by fanning the request out to every ring member and merging the answers; prefetch
-discovery uses it and it carries no member or completeness information.
+`cacheprog` prefetch discovery needs no dedicated route: the session manifest lives under
+an ordinary build-cache key derived from the session label, so the helper bootstraps with
+a plain `GET /build-cache/http/go-manifest-<hash>` — the same request its close-time
+manifest update already issues. A missing manifest is an ordinary `404` miss and the build
+simply runs cold.
 
 ### Common response statuses
 
 | Status | Meaning |
 | --- | --- |
-| `400 Bad Request` | Invalid channel ID, artifact identity, reference, channel patch, or missing status session parameter |
+| `400 Bad Request` | Invalid channel ID, artifact identity, reference, or channel patch |
 | `401 Unauthorized` | Missing or incorrect protected-channel credential |
 | `403 Forbidden` | Package redirect or encoded download targets a disallowed origin |
 | `404 Not Found` | Cache miss, absent channel, or channel in `deleting` |
@@ -590,7 +589,7 @@ GOCACHEPROG='flywheel cacheprog \
 | `--ephemeral-cache` | `FLYWHEEL_CACHEPROG_EPHEMERAL_CACHE` | Use a fresh local cache for this process and delete it on exit |
 | `--session` | `FLYWHEEL_SESSION` | Stable label for the prefetch manifest |
 | `--prune-days` | `FLYWHEEL_CACHEPROG_PRUNE_DAYS` | Local object age limit; default 14, `0` disables pruning |
-| `--prefetch-concurrency` | `FLYWHEEL_CACHEPROG_PREFETCH_CONCURRENCY` | Bound on parallel prefetch downloads; default 8, `0` disables prefetch |
+| `--prefetch-concurrency` | `FLYWHEEL_CACHEPROG_PREFETCH_CONCURRENCY` | Bound on parallel prefetch downloads; default 8, `0` disables downloads but keeps the single manifest GET |
 
 Without `--cache-dir`, the helper uses the system temporary directory. A reusable CI
 volume substantially improves warm builds. The helper verifies digests before publishing a
@@ -599,17 +598,22 @@ cache behavior.
 
 Use `--ephemeral-cache` to prevent reuse between cacheprog processes. The helper creates a
 fresh child under `--cache-dir` (or the system temporary directory), uses it normally for
-the process, and deletes it after close.
+the process, and deletes it after close. On `SIGINT`, cacheprog stops reading new protocol
+messages, cancels requests still in flight, finalizes the session manifest, and performs the
+same local-cache cleanup as a protocol close.
 
-At startup the helper asks `GET /status?session=<label>` at its configured cache origin
-for the session manifest, then warms its object directory with parallel ordinary cache
-GETs bounded by `--prefetch-concurrency`. A foreground Go request for an object the pool
-is currently downloading waits for that download instead of fetching the same bytes
-twice; if the download fails, the request falls back to its ordinary fetch. Against a single replica, the replica answers
-its own status route; in a replicated deployment, point `--url` at a pod-local agent so
-the agent merges the manifest across shards and routes each download to its owner.
-`--prefetch-concurrency 0` is the rollback switch: it disables all prefetch traffic while
-leaving foreground caching and the manifest update at close untouched. The helper logs one
+At startup the helper issues one plain GET of the session's manifest key — the same
+ordinary build-cache request its close-time manifest update uses — then warms its object
+directory with parallel ordinary cache GETs bounded by `--prefetch-concurrency`, one per
+distinct output. Zero-size outputs are never downloaded: the helper synthesizes the one
+empty object locally and answers those actions without touching the network. A foreground
+Go request for an object the pool has queued or is downloading waits for that download
+instead of fetching the same bytes twice; if the download fails, the request falls back
+to its ordinary fetch. In a replicated deployment, point `--url` at a pod-local agent so
+the ring routes the manifest GET and each download to its owner.
+`--prefetch-concurrency 0` is the rollback switch: it disables the parallel downloads —
+the session then issues only the single manifest GET, which still powers local answers
+and the close-time manifest update. With `--debug`, the helper logs one
 summary line per session with advertised, locally present, attempted, downloaded, and
 missed objects, bytes, duration, and peak concurrency.
 
@@ -744,9 +748,6 @@ Replica metrics at `/metrics` are process-wide and have no channel label.
 | `flywheel_prefetch_transfers_total` | Counter | Prefetch bodies labeled `completed` or `cancelled` |
 | `flywheel_prefetch_response_bytes_total` | Counter | Prefetch body bytes actually streamed |
 | `flywheel_prefetch_transfer_duration_seconds` | Histogram | Prefetch response-body lifetime |
-| `flywheel_prefetch_status_requests_total` | Counter | Session manifest lookups answered by the shard |
-| `flywheel_prefetch_status_manifest_entries` | Histogram | Entries returned by shard-local session manifests |
-| `flywheel_prefetch_status_duration_seconds` | Histogram | Shard-local manifest lookup latency |
 | `flywheel_free_observed_bytes` | Gauge | Last successful filesystem free-space reading |
 | `flywheel_reserved_bytes` | Gauge | Capacity held by in-flight writes |
 | `flywheel_committed_since_bytes` | Gauge | New bytes not yet included in the free-space reading |
@@ -921,11 +922,10 @@ Operational constraints:
   with an empty ring.
 
 Use `GET /status` to inspect the ring fingerprint, last DNS refresh, last discovery error,
-members, failure counts, retry times, and ejection state. `GET /status?session=<label>`
-instead returns the merged `cacheprog` session manifest: the agent queries every member of
-one ring snapshot concurrently, merges successful answers by recency, and returns only the
-manifest — failed members contribute nothing and appear in metrics and logs, never in the
-response. Monitor these agent metrics:
+members, failure counts, retry times, and ejection state. `cacheprog` manifest discovery
+is ordinary build-cache traffic — a GET of the manifest key, routed to its ring owner like
+any other key — so it appears in the forwarding and prefetch counters, not on a dedicated
+route. Monitor these agent metrics:
 
 ```text
 flywheel_agent_requests_total
@@ -935,13 +935,6 @@ flywheel_agent_synthesized_misses_total
 flywheel_agent_synthesized_write_bypasses_total
 flywheel_agent_unavailable_total
 flywheel_agent_ejections_total
-flywheel_agent_status_fanout_requests_total
-flywheel_agent_status_fanout_in_flight
-flywheel_agent_status_fanout_duration_seconds
-flywheel_agent_status_fanout_members_queried_total
-flywheel_agent_status_fanout_members_succeeded_total
-flywheel_agent_status_fanout_members_failed_total
-flywheel_agent_status_fanout_manifest_entries
 flywheel_agent_prefetch_requests_total
 flywheel_agent_prefetch_hits_total
 flywheel_agent_prefetch_misses_total
@@ -956,19 +949,13 @@ flywheel_agent_ring_members
 flywheel_agent_ring_ejected
 ```
 
-The `status_fanout` metrics describe manifest discovery, including concurrent fan-outs,
-latency distribution, members omitted by failures, and returned manifest size. The
-`prefetch` metrics describe forwarded cache requests carrying the telemetry-only
+The `prefetch` metrics describe forwarded cache requests carrying the telemetry-only
 `x-flywheel-request-purpose: prefetch` header: a hit is a `2xx`, a miss a `404`, and
 everything else — including degraded responses with no owner — is unavailable. The header
 never changes routing, admission, authorization, or responses.
 
 Recommended dashboards and alerts for prefetch:
 
-- Fan-out health: graph `members_failed` against `members_queried` and alert on a
-  sustained failure ratio — it means shards are unreachable from this agent even if
-  foreground traffic still fails open. Empty manifests are not alertable by themselves;
-  a new session label legitimately starts empty.
 - Prefetch effectiveness: graph the hit ratio (`prefetch_hits` over `prefetch_requests`)
   and `prefetch_response_bytes` alongside build duration. Alert on prefetch degradation
   (hit ratio collapsing, or `prefetch_unavailable` rising) rather than on volume.
@@ -1006,10 +993,10 @@ artifact cache or a channel credential. `flywheel cacheprog` keeps its verified 
 objects in the build container's configured cache directory.
 
 The pod-local agent is the required topology for `cacheprog` prefetch against replicated
-shards: manifest discovery and every prefetch download go through the agent's
-`/status?session=` fan-out and ring routing. Without an agent in front of the ring,
-cacheprog only sees one replica's manifest and objects, and prefetch degrades to whatever
-that replica holds.
+shards: the manifest GET and every prefetch download are ordinary cache requests the
+agent routes to their ring owners. Without an agent in front of the ring, cacheprog only
+sees one replica's manifest and objects, and prefetch degrades to whatever that replica
+holds.
 
 Install only the shards and headless discovery Service:
 

@@ -42,9 +42,6 @@ pub struct Metrics {
     prefetch_transfers: IntCounterVec,
     prefetch_response_bytes: IntCounter,
     prefetch_transfer_duration: Histogram,
-    prefetch_status_requests: IntCounter,
-    prefetch_status_manifest_entries: Histogram,
-    prefetch_status_duration: Histogram,
     free_observed_bytes: IntGauge,
     reserved_bytes: IntGauge,
     committed_since_bytes: IntGauge,
@@ -172,23 +169,6 @@ impl Metrics {
             "Prefetch response body lifetime, including transfers cancelled by the client.",
             transfer_buckets(),
         )?;
-        let prefetch_status_requests = int_counter(
-            &registry,
-            "flywheel_prefetch_status_requests_total",
-            "Session manifest status requests answered by this shard.",
-        )?;
-        let prefetch_status_manifest_entries = histogram(
-            &registry,
-            "flywheel_prefetch_status_manifest_entries",
-            "Number of manifest entries returned by a shard status request.",
-            vec![0.0, 1.0, 10.0, 100.0, 1_000.0, 10_000.0, 32_768.0],
-        )?;
-        let prefetch_status_duration = histogram(
-            &registry,
-            "flywheel_prefetch_status_duration_seconds",
-            "Time to resolve and read a shard-local session manifest.",
-            request_buckets(),
-        )?;
         let free_observed_bytes = int_gauge(
             &registry,
             "flywheel_free_observed_bytes",
@@ -226,9 +206,6 @@ impl Metrics {
             prefetch_transfers,
             prefetch_response_bytes,
             prefetch_transfer_duration,
-            prefetch_status_requests,
-            prefetch_status_manifest_entries,
-            prefetch_status_duration,
             free_observed_bytes,
             reserved_bytes,
             committed_since_bytes,
@@ -323,14 +300,6 @@ impl Metrics {
             .inc();
     }
 
-    pub(crate) fn prefetch_status_finished(&self, duration: Duration, entries: usize) {
-        self.prefetch_status_requests.inc();
-        self.prefetch_status_manifest_entries
-            .observe(entries as f64);
-        self.prefetch_status_duration
-            .observe(duration.as_secs_f64());
-    }
-
     pub fn record_space(&self, free_observed: u64, reserved: u64, committed_since: u64) {
         self.free_observed_bytes.set(saturating_i64(free_observed));
         self.reserved_bytes.set(saturating_i64(reserved));
@@ -371,12 +340,6 @@ fn histogram(
         registry,
         Histogram::with_opts(HistogramOpts::new(name, help).buckets(buckets))?,
     )
-}
-
-fn request_buckets() -> Vec<f64> {
-    vec![
-        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-    ]
 }
 
 fn transfer_buckets() -> Vec<f64> {

@@ -7,8 +7,8 @@ use crate::{
     channel::{ChannelError, ChannelId, ChannelLease, ChannelRecord, ChannelService, Lifecycle},
     config::Config,
     manifest::{
-        MANIFEST_VERSION, Manifest, REQUEST_PREFETCH_CONCURRENCY_HEADER, REQUEST_PURPOSE_HEADER,
-        REQUEST_PURPOSE_PREFETCH, REQUEST_SESSION_HEADER, manifest_key,
+        REQUEST_PREFETCH_CONCURRENCY_HEADER, REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH,
+        REQUEST_SESSION_HEADER,
     },
     proxy::ProxyService,
     reference::Reference,
@@ -18,7 +18,7 @@ use async_compression::tokio::bufread::ZstdDecoder;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{MatchedPath, Path, Query, Request, State, rejection::JsonRejection},
+    extract::{MatchedPath, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -85,7 +85,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/metrics", get(metrics))
-        .route("/status", get(status))
         .route("/channels", post(register_channel))
         .route(
             "/channels/{channel}",
@@ -1189,101 +1188,6 @@ async fn serve_reference_artifact(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
-}
-
-#[derive(Deserialize)]
-struct StatusQuery {
-    session: Option<String>,
-}
-
-/// Shard-local manifest lookup for prefetch discovery: the routing agent fans this
-/// request out to every ring member and merges the answers. The shard derives the
-/// shared manifest key from the session label and answers with whatever manifest it
-/// holds locally in the Default Channel — always `200`, degrading to an empty
-/// manifest when the lookup misses or the stored body is unreadable, because
-/// prefetch never fails a build.
-async fn status(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(query): Query<StatusQuery>,
-) -> Response {
-    let Some(session) = query.session else {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "missing_session",
-            "the session query parameter is required",
-        );
-    };
-    let configured_concurrency = headers
-        .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
-    let started = Instant::now();
-    let manifest = match local_manifest(&state, &session).await {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => Manifest::empty(),
-        Err(error) => {
-            tracing::warn!(%error, "session manifest lookup failed");
-            Manifest::empty()
-        }
-    };
-    let duration = started.elapsed();
-    let session_id = manifest_key(&session);
-    state
-        .metrics
-        .prefetch_status_finished(duration, manifest.entries.len());
-    tracing::info!(
-        %session_id,
-        entries = manifest.entries.len(),
-        configured_concurrency,
-        duration_ms = duration.as_millis() as u64,
-        "prefetch session status complete"
-    );
-    Json(manifest).into_response()
-}
-
-async fn local_manifest(
-    state: &Arc<AppState>,
-    session: &str,
-) -> Result<Option<Manifest>, CacheError> {
-    // A saturated foreground budget degrades to an empty manifest rather than
-    // shedding: prefetch is a prediction, not traffic worth queueing for.
-    let Some(_permit) = acquire_foreground(state) else {
-        return Ok(None);
-    };
-    let reference = build_reference("http", &manifest_key(session));
-    let Some(record) = state
-        .cache
-        .resolve_reference(ChannelId::DEFAULT, &reference)
-        .await?
-    else {
-        return Ok(None);
-    };
-    let Some(located) = state
-        .cache
-        .locate(ChannelId::DEFAULT, record.artifact)
-        .await?
-    else {
-        return Ok(None);
-    };
-    let mut content = Vec::new();
-    let read = match located.metadata.encoding {
-        StoredEncoding::Zstd => {
-            ZstdDecoder::new(tokio::io::BufReader::new(located.file))
-                .read_to_end(&mut content)
-                .await
-        }
-        StoredEncoding::Identity => {
-            let mut file = located.file;
-            file.read_to_end(&mut content).await
-        }
-    };
-    if read.is_err() {
-        return Ok(None);
-    }
-    Ok(serde_json::from_slice::<Manifest>(&content)
-        .ok()
-        .filter(|manifest| manifest.version == MANIFEST_VERSION))
 }
 
 async fn put_bazel_cas(

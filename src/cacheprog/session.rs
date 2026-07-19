@@ -2,8 +2,8 @@
 //!
 //! A session remembers which objects the previous build with the same label used
 //! (the manifest, stored server-side under an ordinary build-cache key). At startup
-//! the helper asks its local agent `GET /status?session=<label>` for the merged
-//! manifest and warms the local object directory with bounded parallel cache GETs
+//! the helper GETs that manifest key — plain cache traffic that any route owner
+//! answers — and warms the local object directory with bounded parallel cache GETs
 //! — exactly the requests a foreground miss would issue — while the build runs.
 //! Prefetch is pure prediction: every body is verified against the manifest before
 //! it lands in the scratch directory, and anything missing falls back to a normal
@@ -222,17 +222,23 @@ pub fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// The startup task: fetch the merged manifest from the local agent, then warm the
-/// object directory with bounded parallel cache GETs. Any failure — endpoint
-/// missing on an older server, a dropped connection, a body that fails
-/// verification — degrades to fewer warm objects; everything simply falls back to
-/// normal gets.
+/// The hex digest naming the empty body: every zero-size action resolves to this
+/// one output, so a single synthesized empty file answers all of them locally.
+fn empty_output() -> &'static str {
+    static EMPTY: OnceLock<String> = OnceLock::new();
+    EMPTY.get_or_init(|| hex::encode(Sha256::digest([])))
+}
+
+/// The startup task: fetch the stored manifest by its cache key — the same plain
+/// GET `finalize` issues — then warm the object directory with bounded parallel
+/// cache GETs. Any failure — a dropped connection, a body that fails verification
+/// — degrades to fewer warm objects; everything simply falls back to normal gets.
 pub async fn run_prefetch(
     client: reqwest::Client,
     base: reqwest::Url,
     token: Option<String>,
     directory: PathBuf,
-    label: String,
+    manifest_key: String,
     concurrency: usize,
     state: Arc<SessionState>,
 ) {
@@ -241,13 +247,13 @@ pub async fn run_prefetch(
         &base,
         token.as_deref(),
         &directory,
-        &label,
+        &manifest_key,
         concurrency,
         &state,
     )
     .await
     {
-        tracing::warn!(%error, "build-cache prefetch stopped; falling back to normal gets");
+        tracing::debug!(%error, "build-cache prefetch stopped; falling back to normal gets");
     }
 }
 
@@ -256,31 +262,18 @@ async fn prefetch(
     base: &reqwest::Url,
     token: Option<&str>,
     directory: &Path,
-    label: &str,
+    manifest_key: &str,
     concurrency: usize,
     state: &SessionState,
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
-    let mut status_url = base.clone();
-    status_url.set_path("/status");
-    status_url.set_query(None);
-    let response = client
-        .get(status_url)
-        .query(&[("session", label)])
-        .header(REQUEST_PREFETCH_CONCURRENCY_HEADER, concurrency)
-        .send()
-        .await?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "session status lookup returned {}",
-        response.status()
-    );
-    let manifest: Manifest = serde_json::from_slice(&response.bytes().await?)?;
-    anyhow::ensure!(
-        manifest.version == MANIFEST_VERSION,
-        "unknown manifest version {}",
-        manifest.version
-    );
+    let manifest = match super::send_get(client, base, token, manifest_key).await? {
+        Some(response) => serde_json::from_slice::<Manifest>(&response.bytes().await?)
+            .ok()
+            .filter(|manifest| manifest.version == MANIFEST_VERSION)
+            .unwrap_or_else(Manifest::empty),
+        None => Manifest::empty(),
+    };
     let manifest = state.manifest.get_or_init(|| manifest);
 
     // One download per distinct output: several actions can share one body.
@@ -289,6 +282,17 @@ async fn prefetch(
     let mut local = 0usize;
     for (action, entry) in &manifest.entries {
         if !seen.insert(entry.output.as_str()) {
+            continue;
+        }
+        if entry.size == 0 {
+            // Every zero-size action shares the one empty output; synthesize the
+            // file locally instead of downloading nothing over the network. A
+            // zero-size entry under any other digest can never verify, so it is
+            // dropped from the work list entirely.
+            if entry.output == empty_output() {
+                super::write_disk_file(directory, &entry.output, &[]).await?;
+                local += 1;
+            }
             continue;
         }
         let path = directory.join(&entry.output);
@@ -303,18 +307,33 @@ async fn prefetch(
     }
     let advertised = seen.len();
 
-    let limit = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    if concurrency == 0 {
+        // Downloads are disabled, but the installed manifest still answers
+        // manifest-known gets locally and the elided empty file is in place.
+        tracing::debug!(
+            advertised,
+            local,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "build-cache prefetch downloads disabled; manifest installed"
+        );
+        return Ok(());
+    }
+
+    let limit = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let active = AtomicUsize::new(0);
     let peak = AtomicUsize::new(0);
-    let telemetry_session = crate::manifest::manifest_key(label);
-    let telemetry_session = telemetry_session.as_str();
     let mut downloads: FuturesUnordered<_> = wanted
         .iter()
         .map(|&(action, entry)| {
             let limit = Arc::clone(&limit);
             let active = &active;
             let peak = &peak;
+            // Register before the download queues behind the concurrency bound so
+            // a foreground get for any wanted output — queued or actively
+            // downloading — waits for the pool instead of duplicating the fetch.
+            let inflight = state.begin_download(&entry.output);
             async move {
+                let _inflight = inflight;
                 let _permit = limit
                     .acquire_owned()
                     .await
@@ -326,9 +345,8 @@ async fn prefetch(
                     base,
                     token,
                     directory,
-                    state,
                     PredictedObject {
-                        session_label: telemetry_session,
+                        session_label: manifest_key,
                         concurrency,
                         action,
                         entry,
@@ -362,7 +380,7 @@ async fn prefetch(
         }
     }
     drop(downloads);
-    tracing::info!(
+    tracing::debug!(
         advertised,
         local = local + published_meanwhile,
         attempted,
@@ -401,12 +419,8 @@ async fn download_object(
     base: &reqwest::Url,
     token: Option<&str>,
     directory: &Path,
-    session: &SessionState,
     object: PredictedObject<'_>,
 ) -> anyhow::Result<Fetched> {
-    // Register before the disk recheck so a concurrent foreground get sees either
-    // the finished file or the in-flight marker, never neither.
-    let _inflight = session.begin_download(&object.entry.output);
     let path = directory.join(&object.entry.output);
     // The work list was computed at startup; a foreground get may have published
     // this object while the download waited behind the concurrency bound.
@@ -504,7 +518,7 @@ pub async fn finalize(
     };
     match tokio::time::timeout(FINALIZE_TIMEOUT, update).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(%error, "session manifest update failed"),
-        Err(_) => tracing::warn!("session manifest update timed out"),
+        Ok(Err(error)) => tracing::debug!(%error, "session manifest update failed"),
+        Err(_) => tracing::debug!("session manifest update timed out"),
     }
 }

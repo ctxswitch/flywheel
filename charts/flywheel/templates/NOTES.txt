@@ -27,7 +27,7 @@ Operational constraints:
   * Scaling or replacing shards remaps keys and temporarily lowers hit rate.
   * PodDisruptionBudgets limit voluntary concurrency but do not make cache data durable.
   * cacheprog prefetch against replicated shards requires a pod-local agent
-    sidecar: it merges the session manifest across shards via /status?session=
-    and routes the parallel prefetch downloads.
+    sidecar: the session-manifest GET and the parallel prefetch downloads are
+    ordinary cache requests it routes to their owning shards.
 
 See docs/operations.md and charts/flywheel/README.md before production rollout.
