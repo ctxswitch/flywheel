@@ -134,7 +134,7 @@ where
         base.path().ends_with('/'),
         "cacheprog URL must end with '/'"
     );
-    let directory = cache_directory(args.cache_dir.as_deref()).await?;
+    let directory = cache_directory(args.cache_dir.as_deref(), args.ephemeral_cache).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()?;
@@ -268,9 +268,13 @@ where
         &session_state,
     )
     .await;
-    let object_max_age =
-        (args.prune_days > 0).then(|| Duration::from_secs(args.prune_days * 24 * 60 * 60));
-    prune_stale_files(&directory, std::time::SystemTime::now(), object_max_age).await;
+    if args.ephemeral_cache {
+        tokio::fs::remove_dir_all(&directory).await?;
+    } else {
+        let object_max_age =
+            (args.prune_days > 0).then(|| Duration::from_secs(args.prune_days * 24 * 60 * 60));
+        prune_stale_files(&directory, std::time::SystemTime::now(), object_max_age).await;
+    }
     Ok(())
 }
 
@@ -548,15 +552,15 @@ async fn canonical_path(path: &Path) -> anyhow::Result<String> {
         .into_owned())
 }
 
-/// The local object cache is a stable directory that outlives the session: point
-/// `--cache-dir` at a reusable pod volume or a host directory and consecutive
-/// builds answer straight from disk. Every file in it is content-named and only
-/// ever appears through a verified atomic rename, so reuse needs no re-hashing.
-async fn cache_directory(parent: Option<&Path>) -> anyhow::Result<PathBuf> {
+async fn cache_directory(parent: Option<&Path>, ephemeral: bool) -> anyhow::Result<PathBuf> {
     let parent = parent
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
-    let directory = parent.join("flywheel-cacheprog");
+    let directory = if ephemeral {
+        parent.join(format!("flywheel-cacheprog-{}", Ulid::new()))
+    } else {
+        parent.join("flywheel-cacheprog")
+    };
     tokio::fs::create_dir_all(&directory).await?;
     Ok(directory)
 }

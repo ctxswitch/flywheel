@@ -81,7 +81,8 @@ go build ./...
 it discovers the session manifest through `GET /status?session=` and warms its local cache
 with bounded parallel cache GETs. Against replicated shards, prefetch requires a pod-local
 `flywheel agent` sidecar, which merges the manifest across shards and routes each download.
-Persistent local directories and Kubernetes `hostPath` mounts are documented in the
+Use `--ephemeral-cache` to prevent reuse by later processes. Persistent local directories
+and Kubernetes `hostPath` mounts are documented in the
 [cacheprog operations guide](docs/operations.md#go-build-cache-with-cacheprog).
 
 ### Bazel

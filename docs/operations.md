@@ -558,6 +558,7 @@ GOCACHEPROG='flywheel cacheprog \
 | `--url` | `FLYWHEEL_CACHEPROG_URL` | Generic HTTP build-cache base URL |
 | `--token` | `FLYWHEEL_CACHEPROG_TOKEN` | Protected channel credential |
 | `--cache-dir` | `FLYWHEEL_CACHEPROG_DIR` | Parent of the persistent `flywheel-cacheprog/` directory |
+| `--ephemeral-cache` | `FLYWHEEL_CACHEPROG_EPHEMERAL_CACHE` | Use a fresh local cache for this process and delete it on exit |
 | `--session` | `FLYWHEEL_SESSION` | Stable label for the prefetch manifest |
 | `--prune-days` | `FLYWHEEL_CACHEPROG_PRUNE_DAYS` | Local object age limit; default 14, `0` disables pruning |
 | `--prefetch-concurrency` | `FLYWHEEL_CACHEPROG_PREFETCH_CONCURRENCY` | Bound on parallel prefetch downloads; default 8, `0` disables prefetch |
@@ -566,6 +567,10 @@ Without `--cache-dir`, the helper uses the system temporary directory. A reusabl
 volume substantially improves warm builds. The helper verifies digests before publishing a
 local object. Prefetch and its manifest are optimizations; misses fall back to ordinary Go
 cache behavior.
+
+Use `--ephemeral-cache` to prevent reuse between cacheprog processes. The helper creates a
+fresh child under `--cache-dir` (or the system temporary directory), uses it normally for
+the process, and deletes it after close.
 
 At startup the helper asks `GET /status?session=<label>` at its configured cache origin
 for the session manifest, then warms its object directory with parallel ordinary cache

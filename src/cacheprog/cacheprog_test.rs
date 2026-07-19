@@ -32,12 +32,74 @@ fn args(url: String, cache_dir: &std::path::Path) -> CacheprogArgs {
         url,
         token: None,
         cache_dir: Some(cache_dir.into()),
+        ephemeral_cache: false,
         session: Some("cacheprog-test".into()),
         prune_days: 14,
         // The protocol tests run hermetically; prefetch behavior has its own
         // tests below with explicit concurrency.
         prefetch_concurrency: 0,
     }
+}
+
+#[tokio::test]
+async fn ephemeral_cache_is_removed_after_close() {
+    let app = Router::new().route(
+        "/{*key}",
+        route_get(|| async { StatusCode::NOT_FOUND }).put(|| async { StatusCode::OK }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let parent = tempfile::tempdir().unwrap();
+    let mut options = args(format!("http://{address}/"), parent.path());
+    options.ephemeral_cache = true;
+    let (mut input, cache_input) = tokio::io::duplex(4096);
+    let (cache_output, output) = tokio::io::duplex(4096);
+    let cache = tokio::spawn(run_with_io(
+        options,
+        BufReader::new(cache_input),
+        cache_output,
+    ));
+    let mut output = BufReader::new(output);
+    let mut line = String::new();
+
+    output.read_line(&mut line).await.unwrap();
+    input
+        .write_all(
+            concat!(
+                "{\"ID\":1,\"Command\":\"put\",\"ActionID\":\"Ag==\",",
+                "\"OutputID\":\"LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=\",",
+                "\"BodySize\":5}\n\n\"aGVsbG8=\"\n",
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    line.clear();
+    output.read_line(&mut line).await.unwrap();
+    let put = serde_json::from_str::<serde_json::Value>(&line).unwrap();
+    let disk_path = put["DiskPath"].as_str().unwrap().to_owned();
+    assert!(std::path::Path::new(&disk_path).is_file());
+
+    input
+        .write_all(b"{\"ID\":2,\"Command\":\"close\"}\n\n")
+        .await
+        .unwrap();
+    line.clear();
+    output.read_line(&mut line).await.unwrap();
+    drop(input);
+    cache.await.unwrap().unwrap();
+    server.abort();
+
+    let disk_path = std::path::Path::new(&disk_path);
+    assert!(
+        !disk_path.exists(),
+        "the per-process cache must be deleted after close"
+    );
+    assert!(
+        !parent.path().join("flywheel-cacheprog").exists(),
+        "ephemeral caching must not create the reusable cache directory"
+    );
 }
 
 #[test]
