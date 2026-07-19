@@ -22,3 +22,40 @@ Triage uses the canonical five-label vocabulary. See `docs/agents/triage-labels.
 ### Domain docs
 
 This is a single-context repository. See `docs/agents/domain.md`.
+
+## Testing
+
+### Unit tests
+
+Unit tests live in `*_test.rs` files co-located with their source modules.
+Each test file is declared in the parent `mod.rs` with `#[cfg(test)] mod <name>_test;`.
+Imports use explicit `use super::{Type1, Type2}` rather than `use super::*`.
+
+Example:
+
+```
+src/
+  cache/
+    mod.rs          # declares #[cfg(test)] mod space_test;
+    space.rs        # production code only
+    space_test.rs   # tests for space.rs
+```
+
+### Integration tests
+
+Integration tests live in `tests/integration/`. Cargo auto-discovers them.
+They exercise full Flywheel instances with HTTP routers, real TCP, and
+tempfile-backed storage.
+
+### What to test
+
+- **Unit tests**: single-module behavior, pure functions, edge cases,
+  error paths, and protocol invariants (e.g. frozen hash vectors).
+- **Integration tests**: cross-module workflows, HTTP semantics,
+  concurrency, disk pressure, and failure recovery.
+
+### What not to test
+
+- Don't write tests that only verify trivially true properties
+  (e.g. `assert_eq!(0, 0)`). Every test should fail if the code is broken.
+- Prefer testing observable behavior over internal implementation details.

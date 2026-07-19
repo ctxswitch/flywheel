@@ -3,6 +3,9 @@ mod service;
 mod space;
 mod stripes;
 
+#[cfg(test)]
+mod space_test;
+
 pub use crate::artifact::StoredEncoding;
 pub use crate::storage::{
     local::LocalError,

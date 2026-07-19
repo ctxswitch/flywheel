@@ -41,3 +41,36 @@ url = "2.5.7"
 
 [dev-dependencies]
 tempfile = "3.23.0"
+
+# Integration tests in tests/integration/
+[[test]]
+name = "integration_agent"
+path = "tests/integration/agent.rs"
+
+[[test]]
+name = "integration_build_cache"
+path = "tests/integration/build_cache.rs"
+
+[[test]]
+name = "integration_channels"
+path = "tests/integration/channels.rs"
+
+[[test]]
+name = "integration_cli"
+path = "tests/integration/cli.rs"
+
+[[test]]
+name = "integration_domain"
+path = "tests/integration/domain.rs"
+
+[[test]]
+name = "integration_local_artifacts"
+path = "tests/integration/local_artifacts.rs"
+
+[[test]]
+name = "integration_maintenance"
+path = "tests/integration/maintenance.rs"
+
+[[test]]
+name = "integration_package_proxies"
+path = "tests/integration/package_proxies.rs"
