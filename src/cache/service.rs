@@ -4,7 +4,7 @@ use crate::{
     cache::recent_use::RecentUse,
     cache::space::SpaceLedger,
     cache::stripes::Stripes,
-    channel::{ChannelGates, ChannelId, ChannelStoreError, Lifecycle},
+    channel::{ChannelGates, ChannelId, Lifecycle},
     clock::Clock,
     storage::{
         local::{ArtifactFiles, FilePublication, LocalError, StageOutcome, StagedArtifact},
@@ -534,8 +534,6 @@ pub enum CacheError {
     Local(#[from] LocalError),
     #[error(transparent)]
     Metadata(#[from] MetadataError),
-    #[error(transparent)]
-    ChannelStore(#[from] ChannelStoreError),
     #[error("channel does not exist")]
     MissingChannel,
     #[error("channel is being deleted")]

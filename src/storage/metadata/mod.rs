@@ -48,6 +48,8 @@ pub enum MetadataError {
     Store(String),
     #[error("durable store format is incompatible: {0}")]
     IncompatibleStore(String),
+    #[error("channel already exists")]
+    AlreadyExists,
     #[error("durable record failed: {0}")]
     Record(#[from] crate::storage::records::RecordError),
     #[error("metadata task failed: {0}")]
