@@ -1,7 +1,7 @@
-use super::{Access, ChannelId, ChannelRecord, ChannelStoreError, ChannelToken, Lifecycle};
+use super::{Access, ChannelId, ChannelRecord, ChannelToken, Lifecycle};
 use crate::storage::{
     local::{ArtifactFiles, LocalError},
-    metadata::RocksMetadata,
+    metadata::{MetadataError, RocksMetadata},
 };
 use dashmap::DashMap;
 use std::{
@@ -80,7 +80,7 @@ impl ChannelService {
                 };
                 match self.store.create_channel(record.clone()).await {
                     Ok(()) => record,
-                    Err(ChannelStoreError::AlreadyExists) => self
+                    Err(MetadataError::AlreadyExists) => self
                         .store
                         .channel(ChannelId::DEFAULT)
                         .await?
@@ -238,7 +238,7 @@ pub enum ChannelError {
     #[error("the persisted default channel violates its invariants")]
     InvalidDefault,
     #[error(transparent)]
-    Store(#[from] ChannelStoreError),
+    Store(#[from] MetadataError),
     #[error(transparent)]
     Local(#[from] LocalError),
 }

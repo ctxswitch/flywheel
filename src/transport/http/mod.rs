@@ -12,7 +12,9 @@ use crate::{
     },
     proxy::ProxyService,
     reference::Reference,
-    telemetry::{MakeRequestUlid, Metrics, REQUEST_ID_HEADER},
+    telemetry::{
+        MakeRequestUlid, Metrics, PrefetchObservation, REQUEST_ID_HEADER, observe_prefetch_body,
+    },
 };
 use async_compression::tokio::bufread::ZstdDecoder;
 use axum::{
@@ -335,7 +337,7 @@ async fn count_request(
             .and_then(|value| value.parse::<usize>().ok());
         PrefetchObservation::start(
             Arc::clone(&metrics),
-            route.clone(),
+            Some(route.clone()),
             session,
             configured_concurrency,
         )
@@ -353,105 +355,6 @@ async fn count_request(
         Some(observation) => observe_prefetch_body(response, observation),
         None => response,
     }
-}
-
-struct PrefetchObservation {
-    metrics: Arc<Metrics>,
-    started: Instant,
-    route: String,
-    session: Option<String>,
-    configured_concurrency: Option<usize>,
-    status: u16,
-    bytes: u64,
-    completed: bool,
-}
-
-impl PrefetchObservation {
-    fn start(
-        metrics: Arc<Metrics>,
-        route: String,
-        session: Option<String>,
-        configured_concurrency: Option<usize>,
-    ) -> Self {
-        let in_flight = metrics.prefetch_started();
-        tracing::debug!(
-            %route,
-            session_id = session.as_deref().unwrap_or(""),
-            configured_concurrency,
-            in_flight,
-            "prefetch request started"
-        );
-        Self {
-            metrics,
-            started: Instant::now(),
-            route,
-            session,
-            configured_concurrency,
-            status: 0,
-            bytes: 0,
-            completed: false,
-        }
-    }
-
-    fn set_status(&mut self, status: u16) {
-        self.status = status;
-        self.metrics.prefetch_response(status);
-    }
-
-    fn add_bytes(&mut self, bytes: usize) {
-        self.bytes = self.bytes.saturating_add(bytes as u64);
-    }
-
-    fn complete(mut self) {
-        self.completed = true;
-    }
-}
-
-impl Drop for PrefetchObservation {
-    fn drop(&mut self) {
-        let duration = self.started.elapsed();
-        self.metrics
-            .prefetch_finished(duration, self.bytes, self.completed);
-        tracing::debug!(
-            route = %self.route,
-            session_id = self.session.as_deref().unwrap_or(""),
-            configured_concurrency = self.configured_concurrency,
-            status = self.status,
-            bytes = self.bytes,
-            duration_ms = duration.as_millis() as u64,
-            completed = self.completed,
-            "prefetch request finished"
-        );
-    }
-}
-
-fn observe_prefetch_body(response: Response, mut observation: PrefetchObservation) -> Response {
-    observation.set_status(response.status().as_u16());
-    let (parts, body) = response.into_parts();
-    let stream = Box::pin(body.into_data_stream());
-    let observed = futures_util::stream::unfold(
-        (stream, Some(observation)),
-        |(mut stream, mut observation)| async move {
-            match stream.next().await {
-                Some(Ok(bytes)) => {
-                    observation
-                        .as_mut()
-                        .expect("prefetch observation exists while streaming")
-                        .add_bytes(bytes.len());
-                    Some((Ok(bytes), (stream, observation)))
-                }
-                Some(Err(error)) => Some((Err(error), (stream, observation))),
-                None => {
-                    observation
-                        .take()
-                        .expect("prefetch observation exists at completion")
-                        .complete();
-                    None
-                }
-            }
-        },
-    );
-    Response::from_parts(parts, Body::from_stream(observed))
 }
 
 async fn put_artifact(
