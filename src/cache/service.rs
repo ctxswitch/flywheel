@@ -222,8 +222,15 @@ impl CacheService {
         reference: String,
         artifact: ArtifactId,
     ) -> Result<(), CacheError> {
-        self.bind_reference_with_validators(channel, reference, artifact, None, None)
-            .await
+        self.bind_reference_with_validators(
+            channel,
+            reference,
+            artifact,
+            None,
+            None,
+            Durability::Durable,
+        )
+        .await
     }
 
     pub(crate) async fn bind_reference_with_validators(
@@ -233,8 +240,9 @@ impl CacheService {
         artifact: ArtifactId,
         etag: Option<String>,
         last_modified: Option<String>,
+        durability: Durability,
     ) -> Result<(), CacheError> {
-        let _gate = self.channel_fence(channel).await?;
+        let (_gate, _) = self.channel_fence(channel).await?;
         let _stripe = self.stripes.reference(channel, &reference).await;
         self.metadata
             .bind_reference(
@@ -246,6 +254,7 @@ impl CacheService {
                     etag,
                     last_modified,
                 },
+                durability,
             )
             .await?;
         Ok(())
@@ -264,7 +273,7 @@ impl CacheService {
         channel: ChannelId,
         reference: &str,
     ) -> Result<(), CacheError> {
-        let _gate = self.channel_fence(channel).await?;
+        let (_gate, _) = self.channel_fence(channel).await?;
         let _stripe = self.stripes.reference(channel, reference).await;
         self.metadata.delete_reference(channel, reference).await?;
         Ok(())
@@ -312,11 +321,7 @@ impl CacheService {
     /// channel rotates each pass so an early-exhausted budget does not starve the tail.
     pub async fn run_maintenance_once(&self, limit: usize) -> Result<usize, CacheError> {
         self.space.refresh();
-        self.metrics.record_space(
-            self.space.free_observed(),
-            self.space.reserved(),
-            self.space.committed_since(),
-        );
+        self.metrics.record_space(self.space.snapshot());
         let mode = self.space.mode();
         let now = self.clock.now();
         let mut channels = self.channels().await?;
@@ -439,15 +444,8 @@ impl CacheService {
         // Fence the final mutation against channel deletion: acquire the shared channel
         // gate and recheck `active` so a body staged before deletion cannot be published
         // back into a  channel whose ranges are being (or have been) removed.
-        let _gate = match self.channel_fence(channel).await {
-            Ok(gate) => gate,
-            Err(error) => {
-                staged.discard().await;
-                return Err(error);
-            }
-        };
-        let expiry_seconds = match self.expiry_seconds(channel).await {
-            Ok(expiry_seconds) => expiry_seconds,
+        let (_gate, expiry_seconds) = match self.channel_fence(channel).await {
+            Ok(fence) => fence,
             Err(error) => {
                 staged.discard().await;
                 return Err(error);
@@ -524,17 +522,18 @@ impl CacheService {
     }
 
     /// Acquires the shared channel lifecycle gate (read side) and rechecks that the
-    /// channel is still active, returning the guard to hold across a final mutation.
+    /// channel is still active, returning the guard to hold across a final mutation
+    /// along with the expiry carried by the very record the recheck just read.
     /// A deletion takes the write side, so holding this read guard blocks deletion from
     /// wiping the channel mid-commit, and the active recheck rejects a mutation into a
     /// channel whose deletion has already begun to tear it down.
     async fn channel_fence(
         &self,
         channel: ChannelId,
-    ) -> Result<OwnedRwLockReadGuard<()>, CacheError> {
+    ) -> Result<(OwnedRwLockReadGuard<()>, u64), CacheError> {
         let guard = self.channel_gates.gate(channel).read_owned().await;
         match self.metadata.channel(channel).await? {
-            Some(record) if record.state == Lifecycle::Active => Ok(guard),
+            Some(record) if record.state == Lifecycle::Active => Ok((guard, record.expiry_seconds)),
             Some(_) => Err(CacheError::ChannelDeleting),
             None => Err(CacheError::MissingChannel),
         }

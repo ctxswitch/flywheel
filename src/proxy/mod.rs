@@ -509,6 +509,7 @@ impl ProxyService {
                     record.artifact,
                     record.etag,
                     record.last_modified,
+                    Durability::BestEffort,
                 )
                 .await?;
             return self
@@ -566,6 +567,7 @@ impl ProxyService {
                                 publication.artifact,
                                 etag,
                                 last_modified,
+                                Durability::BestEffort,
                             )
                             .await?;
                         Ok(ProxyOutcome::Artifact(publication.artifact))
@@ -757,6 +759,7 @@ impl ProxyService {
                         publication.artifact,
                         etag,
                         last_modified,
+                        Durability::BestEffort,
                     )
                     .await?;
                 Ok(ProxyOutcome::CachedMetadata {

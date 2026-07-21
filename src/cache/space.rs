@@ -49,6 +49,14 @@ pub enum Mode {
     Reclaiming,
 }
 
+/// One consistent reading of the ledger's exported counters.
+#[derive(Clone, Copy, Debug)]
+pub struct SpaceSnapshot {
+    pub free_observed: u64,
+    pub reserved: u64,
+    pub committed_since: u64,
+}
+
 /// The mutable ledger state guarded by a single mutex. Guarding the snapshot as one
 /// unit keeps a `refresh` from erasing bytes committed after its filesystem sample and
 /// keeps `degraded` observation handling consistent with reservation accounting. The
@@ -173,6 +181,17 @@ impl SpaceLedger {
             .lock()
             .expect("space ledger poisoned")
             .committed_since
+    }
+
+    /// The three published counters read together, so the exported gauges describe one
+    /// consistent ledger state instead of three independently locked samples.
+    pub fn snapshot(&self) -> SpaceSnapshot {
+        let state = self.state.lock().expect("space ledger poisoned");
+        SpaceSnapshot {
+            free_observed: state.free_observed,
+            reserved: state.reserved,
+            committed_since: state.committed_since,
+        }
     }
 }
 

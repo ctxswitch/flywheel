@@ -1,4 +1,5 @@
-use http::{HeaderName, HeaderValue, Request};
+use crate::cache::SpaceSnapshot;
+use http::{HeaderName, HeaderValue, Request, StatusCode};
 use prometheus::{
     Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
     Registry, TextEncoder, core::Collector,
@@ -220,11 +221,11 @@ impl Metrics {
         &self,
         method: &str,
         route: &str,
-        status: u16,
+        status: StatusCode,
         duration: Duration,
     ) {
         self.http_request_duration
-            .with_label_values(&[method, route, &status.to_string()])
+            .with_label_values(&[method, route, status.as_str()])
             .observe(duration.as_secs_f64());
     }
 
@@ -300,11 +301,12 @@ impl Metrics {
             .inc();
     }
 
-    pub fn record_space(&self, free_observed: u64, reserved: u64, committed_since: u64) {
-        self.free_observed_bytes.set(saturating_i64(free_observed));
-        self.reserved_bytes.set(saturating_i64(reserved));
+    pub fn record_space(&self, space: SpaceSnapshot) {
+        self.free_observed_bytes
+            .set(saturating_i64(space.free_observed));
+        self.reserved_bytes.set(saturating_i64(space.reserved));
         self.committed_since_bytes
-            .set(saturating_i64(committed_since));
+            .set(saturating_i64(space.committed_since));
     }
 
     pub fn encode(&self) -> prometheus::Result<Vec<u8>> {

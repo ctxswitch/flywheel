@@ -256,7 +256,7 @@ impl StageWriter {
 
     /// Flushes buffered data through to the file and returns it. The flush matters
     /// even for identity bodies: `tokio::fs::File` completes writes on a background
-    /// task, and the caller stats this file for the stored length.
+    /// task, and the caller publishes this file as soon as it returns.
     async fn finish(self) -> std::io::Result<tokio::fs::File> {
         match self {
             Self::Identity(mut file) => {
@@ -391,7 +391,13 @@ impl ArtifactFiles {
             writer.write_all(&chunk).await?;
         }
         let file = writer.finish().await?;
-        let stored_len = file.metadata().await?.len();
+        // An identity body was written verbatim into a freshly created file, so its
+        // stored length is the byte count already counted above. Only a zstd frame has
+        // an encoded size that has to be read back from the filesystem.
+        let stored_len = match encoding {
+            StoredEncoding::Identity => len,
+            StoredEncoding::Zstd => file.metadata().await?.len(),
+        };
         if stored_len > reservation.outstanding
             && !reservation.reserve(stored_len - reservation.outstanding)
         {
