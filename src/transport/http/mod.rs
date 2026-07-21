@@ -15,13 +15,14 @@ use crate::{
     telemetry::{
         MakeRequestUlid, Metrics, PrefetchObservation, REQUEST_ID_HEADER, observe_prefetch_body,
     },
+    transport::content_length,
 };
 use async_compression::tokio::bufread::ZstdDecoder;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{MatchedPath, Path, Request, State, rejection::JsonRejection},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    extract::{FromRequestParts, MatchedPath, Path, Request, State, rejection::JsonRejection},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -213,6 +214,8 @@ fn data_router() -> Router<Arc<AppState>> {
         )
 }
 
+/// The `{channel}` capture every data route may carry. Present on the `/channels/{id}`
+/// prefixed forms and absent on the bare ones, which resolve to the default channel.
 #[derive(Deserialize)]
 struct ChannelPath {
     channel: Option<String>,
@@ -220,26 +223,22 @@ struct ChannelPath {
 
 #[derive(Deserialize)]
 struct ArtifactPath {
-    channel: Option<String>,
     algorithm: String,
     digest: String,
 }
 
 #[derive(Deserialize)]
 struct ReferencePath {
-    channel: Option<String>,
     reference: String,
 }
 
 #[derive(Deserialize)]
 struct KeyPath {
-    channel: Option<String>,
     key: String,
 }
 
 #[derive(Deserialize)]
 struct HashPath {
-    channel: Option<String>,
     hash: String,
 }
 
@@ -251,12 +250,22 @@ pub(super) struct ChannelContext {
     pub access_control: bool,
 }
 
-impl ChannelContext {
-    async fn resolve(
+/// Resolves and authorizes the channel a data request addresses, so every data handler
+/// gets it by taking a `ChannelContext` argument instead of repeating the lookup.
+///
+/// The `{channel}` capture is read through `Path`, which borrows the captured
+/// parameters out of the request extensions rather than taking them, so a handler can
+/// still extract its own `Path<T>` for the rest of the route.
+impl FromRequestParts<Arc<AppState>> for ChannelContext {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
         state: &Arc<AppState>,
-        channel: Option<&str>,
-        headers: &HeaderMap,
-    ) -> Result<Self, Response> {
+    ) -> Result<Self, Self::Rejection> {
+        let Path(ChannelPath { channel }) = Path::<ChannelPath>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| invalid_channel())?;
         let Some(channel) = channel else {
             return Ok(Self {
                 channel: ChannelId::DEFAULT,
@@ -264,14 +273,16 @@ impl ChannelContext {
                 access_control: false,
             });
         };
-        let record = authorize_channel(state, channel, headers).await?;
+        let record = authorize_channel(state, &channel, &parts.headers).await?;
         Ok(Self {
             channel: record.id,
             scope: Some(record.id),
             access_control: record.access.is_protected(),
         })
     }
+}
 
+impl ChannelContext {
     /// The path prefix rewritten package URLs must carry to route back to this
     /// channel. Only the package-proxy handlers rewrite URLs, so it is built on
     /// demand rather than on every request.
@@ -359,31 +370,24 @@ async fn count_request(
 
 async fn put_artifact(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ArtifactPath>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(artifact) = ArtifactId::parse(&path.algorithm, &path.digest) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Some(_permit) = acquire_foreground(&state) else {
         return busy_response();
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let content_length = content_length(&headers);
     match state
         .cache
         .publish(PublishRequest {
             channel: context.channel,
             target: PublicationTarget::ById(artifact),
-            content_type,
+            content_type: content_type(&headers),
             stream: body.into_data_stream(),
             content_length,
             durability: Durability::Durable,
@@ -395,36 +399,17 @@ async fn put_artifact(
             StatusCode::CREATED.into_response()
         }
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(CacheError::Local(crate::storage::local::LocalError::OutOfSpace)) => {
-            state.metrics.raw_pressure_error();
-            insufficient_storage()
-        }
-        Err(CacheError::Local(crate::storage::local::LocalError::DigestMismatch)) => {
-            StatusCode::CONFLICT.into_response()
-        }
-        Err(CacheError::Local(crate::storage::local::LocalError::TooLarge)) => {
-            StatusCode::PAYLOAD_TOO_LARGE.into_response()
-        }
-        Err(CacheError::ChannelDeleting | CacheError::MissingChannel) => {
-            StatusCode::NOT_FOUND.into_response()
-        }
-        Err(error) => {
-            tracing::error!(error = %error, "artifact publication failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Err(error) => cache_write_failure(&state, error),
     }
 }
 
 async fn get_artifact(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ArtifactPath>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(artifact) = ArtifactId::parse(&path.algorithm, &path.digest) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -562,13 +547,17 @@ struct ArtifactBinding {
     digest: String,
 }
 
+/// The one data handler that takes its `ChannelContext` as a `Result`: extractors run
+/// before the body, so rejecting here would answer a syntactically broken request with
+/// a channel error. Holding the rejection until the body has parsed keeps a malformed
+/// payload a 400 whatever the channel's access control says.
 async fn put_reference(
     State(state): State<Arc<AppState>>,
+    context: Result<ChannelContext, Response>,
     Path(path): Path<ReferencePath>,
-    headers: HeaderMap,
     Json(binding): Json<ArtifactBinding>,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
+    let context = match context {
         Ok(context) => context,
         Err(response) => return response,
     };
@@ -613,13 +602,9 @@ async fn put_reference(
 
 async fn get_reference(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ReferencePath>,
-    headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(reference) = Reference::parse(path.reference) else {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -658,13 +643,9 @@ async fn get_reference(
 
 async fn delete_reference(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ReferencePath>,
-    headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(reference) = Reference::parse(path.reference) else {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -908,20 +889,11 @@ async fn channel_lease(
     let channel = channel
         .parse::<ChannelId>()
         .map_err(|_| invalid_channel())?;
-    let credential = credential(headers);
-    match state
+    state
         .channels
-        .authorize_with_lease(channel, credential.as_deref())
+        .authorize_with_lease(channel, credential(headers).as_deref())
         .await
-    {
-        Ok(lease) => Ok(lease),
-        Err(error) => {
-            if matches!(error, ChannelError::Unauthorized) {
-                state.metrics.authorization_denial();
-            }
-            Err(channel_failure(error))
-        }
-    }
+        .map_err(|error| channel_denied(state, error))
 }
 
 /// Validates channel credentials and `active` state without taking the lifecycle gate.
@@ -934,20 +906,20 @@ async fn authorize_channel(
     let channel = channel
         .parse::<ChannelId>()
         .map_err(|_| invalid_channel())?;
-    let credential = credential(headers);
-    match state
+    state
         .channels
-        .authorize(channel, credential.as_deref())
+        .authorize(channel, credential(headers).as_deref())
         .await
-    {
-        Ok(record) => Ok(record),
-        Err(error) => {
-            if matches!(error, ChannelError::Unauthorized) {
-                state.metrics.authorization_denial();
-            }
-            Err(channel_failure(error))
-        }
+        .map_err(|error| channel_denied(state, error))
+}
+
+/// The response for a rejected channel authorization, counting the denials that were
+/// credential failures rather than missing or deleting channels.
+fn channel_denied(state: &Arc<AppState>, error: ChannelError) -> Response {
+    if matches!(error, ChannelError::Unauthorized) {
+        state.metrics.authorization_denial();
     }
+    channel_failure(error)
 }
 
 fn invalid_channel() -> Response {
@@ -977,7 +949,9 @@ fn credential(headers: &HeaderMap) -> Option<String> {
 
 fn channel_failure(error: ChannelError) -> Response {
     match error {
-        ChannelError::NotFound => api_error(
+        // A channel being deleted is indistinguishable from an absent one to a client:
+        // its data is already unreachable and its id will never be reused.
+        ChannelError::NotFound | ChannelError::Deleting => api_error(
             StatusCode::NOT_FOUND,
             "channel_not_found",
             "channel does not exist",
@@ -994,11 +968,6 @@ fn channel_failure(error: ChannelError) -> Response {
             );
             response
         }
-        ChannelError::Deleting => api_error(
-            StatusCode::NOT_FOUND,
-            "channel_not_found",
-            "channel does not exist",
-        ),
         ChannelError::DefaultChannel => api_error(
             StatusCode::CONFLICT,
             "default_channel",
@@ -1021,24 +990,17 @@ fn build_reference(kind: &str, key: &str) -> String {
 
 async fn put_http_cache(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<KeyPath>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     if !Reference::is_valid(&path.key) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let Some(_permit) = acquire_foreground(&state) else {
         return busy_response();
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let content_length = content_length(&headers);
     match state
         .cache
@@ -1047,7 +1009,7 @@ async fn put_http_cache(
             target: PublicationTarget::ContentAddressed {
                 reference: Some(build_reference("http", &path.key)),
             },
-            content_type,
+            content_type: content_type(&headers),
             stream: body.into_data_stream(),
             content_length,
             durability: Durability::BestEffort,
@@ -1062,14 +1024,11 @@ async fn put_http_cache(
 
 async fn get_http_cache(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<KeyPath>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     serve_reference_artifact(
         state,
         context.channel,
@@ -1108,31 +1067,24 @@ async fn serve_reference_artifact(
 
 async fn put_bazel_cas(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<HashPath>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(artifact) = ArtifactId::parse("sha256", &path.hash) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Some(_permit) = acquire_foreground(&state) else {
         return busy_response();
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let content_length = content_length(&headers);
     match state
         .cache
         .publish(PublishRequest {
             channel: context.channel,
             target: PublicationTarget::ById(artifact),
-            content_type,
+            content_type: content_type(&headers),
             stream: body.into_data_stream(),
             content_length,
             durability: Durability::Durable,
@@ -1141,24 +1093,17 @@ async fn put_bazel_cas(
         .await
     {
         Ok(_) => StatusCode::OK.into_response(),
-        Err(CacheError::Local(crate::storage::local::LocalError::OutOfSpace)) => {
-            state.metrics.raw_pressure_error();
-            insufficient_storage()
-        }
-        Err(error) => cache_write_failure(error),
+        Err(error) => cache_write_failure(&state, error),
     }
 }
 
 async fn get_bazel_cas(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<HashPath>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(artifact) = ArtifactId::parse("sha256", &path.hash) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -1174,24 +1119,17 @@ async fn get_bazel_cas(
 
 async fn put_bazel_ac(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<HashPath>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     if ArtifactId::parse("sha256", &path.hash).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let Some(_permit) = acquire_foreground(&state) else {
         return busy_response();
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let content_length = content_length(&headers);
     match state
         .cache
@@ -1200,7 +1138,7 @@ async fn put_bazel_ac(
             target: PublicationTarget::ContentAddressed {
                 reference: Some(build_reference("bazel-ac", &path.hash)),
             },
-            content_type,
+            content_type: content_type(&headers),
             stream: body.into_data_stream(),
             content_length,
             durability: Durability::BestEffort,
@@ -1215,14 +1153,11 @@ async fn put_bazel_ac(
 
 async fn get_bazel_ac(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<HashPath>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     // No hex validation on the read: an unparseable hash cannot name a stored action
     // result either, so it takes the same reference lookup and misses, exactly as the
     // HTTP build-cache read does.
@@ -1236,8 +1171,15 @@ async fn get_bazel_ac(
     .await
 }
 
-fn cache_write_failure(error: CacheError) -> Response {
+/// The response for a failed upload. Disk pressure is reported to the client as 507
+/// with a retry hint; the artifact and Bazel CAS routes have no protocol-level way to
+/// say "stored elsewhere", so they cannot bypass the way the build-cache writes do.
+fn cache_write_failure(state: &Arc<AppState>, error: CacheError) -> Response {
     match error {
+        CacheError::Local(crate::storage::local::LocalError::OutOfSpace) => {
+            state.metrics.raw_pressure_error();
+            insufficient_storage()
+        }
         CacheError::Local(crate::storage::local::LocalError::DigestMismatch) => {
             StatusCode::CONFLICT.into_response()
         }
@@ -1248,7 +1190,7 @@ fn cache_write_failure(error: CacheError) -> Response {
             StatusCode::NOT_FOUND.into_response()
         }
         error => {
-            tracing::error!(error = %error, "build-cache write failed");
+            tracing::error!(error = %error, "cache write failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1264,16 +1206,14 @@ fn cache_write_failure_with_bypass(state: &Arc<AppState>, error: CacheError) -> 
         state.metrics.build_cache_bypass();
         return StatusCode::OK.into_response();
     }
-    cache_write_failure(error)
+    cache_write_failure(state, error)
 }
 
-fn content_length(headers: &HeaderMap) -> Option<u64> {
+fn content_type(headers: &HeaderMap) -> Option<String> {
     headers
-        .get(header::CONTENT_LENGTH)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 fn insufficient_storage() -> Response {
