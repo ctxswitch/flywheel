@@ -88,9 +88,9 @@ fn three_member_owners_match_frozen_vectors() {
 }
 
 #[test]
-fn kinds_place_independently_and_cas_shares_artifact_placement() {
+fn distinct_kinds_place_the_same_id_independently() {
     // The action record and an output that reuses the same hex string are distinct
-    // routing objects, while the raw-artifact and Bazel CAS routes share a kind.
+    // routing objects.
     assert_ne!(
         key_position("artifact", DIGEST_A),
         key_position("bazel-action", DIGEST_A)
@@ -120,7 +120,6 @@ fn construction_is_independent_of_discovery_order() {
 fn duplicate_member_ids_collapse_to_one_member() {
     let ring = Ring::new(vec![member("flywheel-0"), member("flywheel-0")]);
     assert_eq!(ring.members().len(), 1);
-    // One member with VIRTUAL_NODES virtual nodes
 }
 
 #[test]

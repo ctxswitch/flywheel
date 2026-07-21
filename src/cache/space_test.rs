@@ -12,15 +12,21 @@ impl FreeSpace for Fixed {
     }
 }
 
-fn ledger(free: u64) -> SpaceLedger {
+/// Every case here exercises the same watermark policy; only the free-space
+/// source differs.
+fn ledger_from(source: Arc<dyn FreeSpace>) -> SpaceLedger {
     SpaceLedger::new(
-        Arc::new(Fixed(free)),
+        source,
         SpacePolicy {
             low_watermark: 10,
             high_watermark: 20,
             emergency_headroom: 0,
         },
     )
+}
+
+fn ledger(free: u64) -> SpaceLedger {
+    ledger_from(Arc::new(Fixed(free)))
 }
 
 #[test]
@@ -50,14 +56,7 @@ fn mode_uses_low_high_watermark_hysteresis() {
             Some(self.0.load(Ordering::SeqCst))
         }
     }
-    let ledger = SpaceLedger::new(
-        Arc::new(Dynamic(Arc::clone(&source))),
-        SpacePolicy {
-            low_watermark: 10,
-            high_watermark: 20,
-            emergency_headroom: 0,
-        },
-    );
+    let ledger = ledger_from(Arc::new(Dynamic(Arc::clone(&source))));
     assert_eq!(ledger.mode(), Mode::Normal);
 
     // Below the low watermark enters Reclaiming.
@@ -84,14 +83,7 @@ fn failed_observation_fails_closed_and_reports_degraded() {
             None
         }
     }
-    let ledger = SpaceLedger::new(
-        Arc::new(Failing),
-        SpacePolicy {
-            low_watermark: 10,
-            high_watermark: 20,
-            emergency_headroom: 0,
-        },
-    );
+    let ledger = ledger_from(Arc::new(Failing));
     // An unreadable filesystem starts degraded and admits nothing.
     assert!(ledger.degraded());
     assert!(!ledger.try_reserve(1));
@@ -114,17 +106,10 @@ fn refresh_failure_retains_last_observation_but_stops_reservations() {
         }
     }
     let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ledger = SpaceLedger::new(
-        Arc::new(Maybe {
-            free: Arc::clone(&source),
-            fail: Arc::clone(&fail),
-        }),
-        SpacePolicy {
-            low_watermark: 10,
-            high_watermark: 20,
-            emergency_headroom: 0,
-        },
-    );
+    let ledger = ledger_from(Arc::new(Maybe {
+        free: Arc::clone(&source),
+        fail: Arc::clone(&fail),
+    }));
     assert!(ledger.try_reserve(10));
 
     // The observation now fails: the ledger keeps the last free value for metrics

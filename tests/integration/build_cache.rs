@@ -19,11 +19,10 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::Notify,
 };
-use tower::ServiceExt;
 
-async fn call(app: axum::Router, request: Request<Body>) -> axum::response::Response {
-    app.oneshot(request).await.unwrap()
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::call;
 
 #[tokio::test]
 async fn generic_http_cache_replaces_opaque_keys_with_immutable_content() {

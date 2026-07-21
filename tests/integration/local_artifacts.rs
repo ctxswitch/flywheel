@@ -8,14 +8,13 @@ use sha2::{Digest as _, Sha256};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio::sync::Notify;
-use tower::ServiceExt;
+
+#[path = "common/mod.rs"]
+mod common;
+use common::call;
 
 fn digest(body: &[u8]) -> String {
     hex::encode(Sha256::digest(body))
-}
-
-async fn request(app: axum::Router, request: Request<Body>) -> axum::response::Response {
-    app.oneshot(request).await.unwrap()
 }
 
 #[tokio::test]
@@ -26,7 +25,7 @@ async fn responses_propagate_or_create_request_ids() {
         .unwrap()
         .router();
 
-    let generated = request(
+    let generated = call(
         app.clone(),
         Request::get("/health/ready").body(Body::empty()).unwrap(),
     )
@@ -34,7 +33,7 @@ async fn responses_propagate_or_create_request_ids() {
     let generated = generated.headers()["x-request-id"].to_str().unwrap();
     assert!(ulid::Ulid::from_string(generated).is_ok());
 
-    let provided = request(
+    let provided = call(
         app,
         Request::get("/health/ready")
             .header("x-request-id", "caller-request")
@@ -56,7 +55,7 @@ async fn publishes_streams_ranges_and_recovers_local_artifacts() {
         let flywheel = Flywheel::open(Config::new(directory.path())).await.unwrap();
         let app = flywheel.router();
 
-        let response = request(
+        let response = call(
             app.clone(),
             Request::put(&path)
                 .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -66,7 +65,7 @@ async fn publishes_streams_ranges_and_recovers_local_artifacts() {
         .await;
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let duplicate = request(
+        let duplicate = call(
             app.clone(),
             Request::put(&path)
                 .body(Body::from(body.as_slice()))
@@ -75,14 +74,14 @@ async fn publishes_streams_ranges_and_recovers_local_artifacts() {
         .await;
         assert_eq!(duplicate.status(), StatusCode::NO_CONTENT);
 
-        let corrupt = request(
+        let corrupt = call(
             app.clone(),
             Request::put(&path).body(Body::from("different")).unwrap(),
         )
         .await;
         assert_eq!(corrupt.status(), StatusCode::CONFLICT);
 
-        let response = request(
+        let response = call(
             app.clone(),
             Request::get(&path).body(Body::empty()).unwrap(),
         )
@@ -101,7 +100,7 @@ async fn publishes_streams_ranges_and_recovers_local_artifacts() {
             body.as_slice()
         );
 
-        let range = request(
+        let range = call(
             app.clone(),
             Request::get(&path)
                 .header(header::RANGE, "bytes=6-12")
@@ -119,7 +118,7 @@ async fn publishes_streams_ranges_and_recovers_local_artifacts() {
             &body[6..=12]
         );
 
-        let head = request(app, Request::head(&path).body(Body::empty()).unwrap()).await;
+        let head = call(app, Request::head(&path).body(Body::empty()).unwrap()).await;
         assert_eq!(head.status(), StatusCode::OK);
         assert_eq!(
             head.headers()[header::CONTENT_LENGTH],
@@ -134,7 +133,7 @@ async fn publishes_streams_ranges_and_recovers_local_artifacts() {
     }
 
     let recovered = Flywheel::open(Config::new(directory.path())).await.unwrap();
-    let response = request(
+    let response = call(
         recovered.router(),
         Request::get(&path).body(Body::empty()).unwrap(),
     )
@@ -156,7 +155,7 @@ async fn identity_ranges_ignore_invalid_syntax_and_reject_only_non_overlapping_r
     let body = b"0123456789";
     let path = format!("/artifacts/sha256/{}", digest(body));
     assert_eq!(
-        request(
+        call(
             app.clone(),
             Request::put(&path)
                 .body(Body::from(body.as_slice()))
@@ -167,7 +166,7 @@ async fn identity_ranges_ignore_invalid_syntax_and_reject_only_non_overlapping_r
         StatusCode::CREATED
     );
 
-    let range = request(
+    let range = call(
         app.clone(),
         Request::get(&path)
             .header(header::RANGE, "bytes=2-5")
@@ -191,7 +190,7 @@ async fn identity_ranges_ignore_invalid_syntax_and_reject_only_non_overlapping_r
         "bytes=0-1,4-5",
         "bytes=5-4",
     ] {
-        let response = request(
+        let response = call(
             app.clone(),
             Request::get(&path)
                 .header(header::RANGE, invalid)
@@ -210,7 +209,7 @@ async fn identity_ranges_ignore_invalid_syntax_and_reject_only_non_overlapping_r
     }
 
     for unsatisfiable in ["bytes=20-30", "bytes=-0"] {
-        let response = request(
+        let response = call(
             app.clone(),
             Request::get(&path)
                 .header(header::RANGE, unsatisfiable)
@@ -227,7 +226,7 @@ async fn identity_ranges_ignore_invalid_syntax_and_reject_only_non_overlapping_r
         assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */10");
     }
 
-    let head = request(
+    let head = call(
         app.clone(),
         Request::head(&path)
             .header(header::RANGE, "bytes=2-5")
@@ -248,7 +247,7 @@ async fn identity_ranges_ignore_invalid_syntax_and_reject_only_non_overlapping_r
 
     // GET-only build-cache routes are also invoked for HEAD by axum; they must pass
     // that method through so the shared artifact responder ignores Range.
-    let cas_head = request(
+    let cas_head = call(
         app,
         Request::head(format!("/build-cache/bazel/cas/{}", digest(body)))
             .header(header::RANGE, "bytes=2-5")
@@ -271,7 +270,7 @@ async fn empty_identity_representation_has_only_unsatisfiable_valid_ranges() {
         .router();
     let path = format!("/artifacts/sha256/{}", digest(b""));
     assert_eq!(
-        request(
+        call(
             app.clone(),
             Request::put(&path).body(Body::empty()).unwrap()
         )
@@ -280,7 +279,7 @@ async fn empty_identity_representation_has_only_unsatisfiable_valid_ranges() {
         StatusCode::CREATED
     );
 
-    let unsatisfiable = request(
+    let unsatisfiable = call(
         app.clone(),
         Request::get(&path)
             .header(header::RANGE, "bytes=0-0")
@@ -291,7 +290,7 @@ async fn empty_identity_representation_has_only_unsatisfiable_valid_ranges() {
     assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
     assert_eq!(unsatisfiable.headers()[header::CONTENT_RANGE], "bytes */0");
 
-    let malformed = request(
+    let malformed = call(
         app,
         Request::get(&path)
             .header(header::RANGE, "bytes=garbage")
@@ -336,7 +335,7 @@ async fn concurrent_duplicate_put_commits_independently_before_the_leader() {
             Ok::<_, Infallible>(body)
         }
     });
-    let leader = tokio::spawn(request(
+    let leader = tokio::spawn(call(
         app.clone(),
         Request::put(&path)
             .body(Body::from_stream(leader_stream))
@@ -348,7 +347,7 @@ async fn concurrent_duplicate_put_commits_independently_before_the_leader() {
     // first to commit.
     let follower = tokio::time::timeout(
         Duration::from_secs(1),
-        request(
+        call(
             app.clone(),
             Request::put(&path).body(Body::from(body.clone())).unwrap(),
         ),
@@ -357,7 +356,7 @@ async fn concurrent_duplicate_put_commits_independently_before_the_leader() {
     .expect("a duplicate PUT must not wait for the in-flight leader");
     assert_eq!(follower.status(), StatusCode::CREATED);
 
-    let after_follower = request(
+    let after_follower = call(
         app.clone(),
         Request::get(&path).body(Body::empty()).unwrap(),
     )
@@ -373,7 +372,7 @@ async fn concurrent_duplicate_put_commits_independently_before_the_leader() {
     // The leader finishes second, finds the committed row, and reports the duplicate.
     release_leader_body.notify_one();
     assert_eq!(leader.await.unwrap().status(), StatusCode::NO_CONTENT);
-    let after_leader = request(
+    let after_leader = call(
         app.clone(),
         Request::get(&path).body(Body::empty()).unwrap(),
     )
@@ -426,7 +425,7 @@ async fn failed_publication_does_not_block_a_later_put() {
     let failing_stream = stream::once(async {
         Err::<bytes::Bytes, _>(std::io::Error::other("injected upload failure"))
     });
-    let failed = request(
+    let failed = call(
         app.clone(),
         Request::put(&path)
             .body(Body::from_stream(failing_stream))
@@ -435,13 +434,13 @@ async fn failed_publication_does_not_block_a_later_put() {
     .await;
     assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-    let retry = request(
+    let retry = call(
         app.clone(),
         Request::put(&path).body(Body::from(body.clone())).unwrap(),
     )
     .await;
     assert_eq!(retry.status(), StatusCode::CREATED);
-    let stored = request(app, Request::get(&path).body(Body::empty()).unwrap()).await;
+    let stored = call(app, Request::get(&path).body(Body::empty()).unwrap()).await;
     assert_eq!(stored.status(), StatusCode::OK);
     assert_eq!(
         to_bytes(stored.into_body(), usize::MAX).await.unwrap(),
@@ -460,7 +459,7 @@ async fn logical_references_are_atomic_and_retryable() {
     let digest = digest(body);
     let artifact = format!("/artifacts/sha256/{digest}");
     assert_eq!(
-        request(
+        call(
             app.clone(),
             Request::put(&artifact)
                 .body(Body::from(body.as_slice()))
@@ -473,7 +472,7 @@ async fn logical_references_are_atomic_and_retryable() {
 
     let binding = serde_json::json!({"algorithm": "sha256", "digest": digest});
     for _ in 0..2 {
-        let response = request(
+        let response = call(
             app.clone(),
             Request::put("/references/toolchain")
                 .header(header::CONTENT_TYPE, "application/json")
@@ -484,7 +483,7 @@ async fn logical_references_are_atomic_and_retryable() {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
-    let response = request(
+    let response = call(
         app.clone(),
         Request::get("/references/toolchain")
             .body(Body::empty())
@@ -502,7 +501,7 @@ async fn logical_references_are_atomic_and_retryable() {
 
     for _ in 0..2 {
         assert_eq!(
-            request(
+            call(
                 app.clone(),
                 Request::delete("/references/toolchain")
                     .body(Body::empty())
@@ -526,7 +525,7 @@ async fn get_self_heals_metadata_pointing_at_a_missing_body() {
     let digest = digest(body);
     let path = format!("/artifacts/sha256/{digest}");
     assert_eq!(
-        request(
+        call(
             app.clone(),
             Request::put(&path)
                 .body(Body::from(body.as_slice()))
@@ -548,7 +547,7 @@ async fn get_self_heals_metadata_pointing_at_a_missing_body() {
 
     for _ in 0..2 {
         assert_eq!(
-            request(
+            call(
                 app.clone(),
                 Request::get(&path).body(Body::empty()).unwrap()
             )
@@ -602,7 +601,7 @@ async fn streaming_get_holds_the_transport_budget_and_sheds_with_429() {
 
     let body = b"budgeted body";
     let path = format!("/artifacts/sha256/{}", digest(body));
-    let put = request(
+    let put = call(
         app.clone(),
         Request::put(&path)
             .body(Body::from(body.as_slice()))
@@ -613,14 +612,14 @@ async fn streaming_get_holds_the_transport_budget_and_sheds_with_429() {
 
     // The permit is moved into the body stream when the response is built, so
     // holding the unconsumed response deterministically holds the budget's only slot.
-    let held = request(
+    let held = call(
         app.clone(),
         Request::get(&path).body(Body::empty()).unwrap(),
     )
     .await;
     assert_eq!(held.status(), StatusCode::OK);
 
-    let shed = request(
+    let shed = call(
         app.clone(),
         Request::get(&path).body(Body::empty()).unwrap(),
     )
@@ -629,7 +628,7 @@ async fn streaming_get_holds_the_transport_budget_and_sheds_with_429() {
     assert_eq!(shed.headers()[header::RETRY_AFTER], "1");
 
     drop(held);
-    let served = request(app, Request::get(&path).body(Body::empty()).unwrap()).await;
+    let served = call(app, Request::get(&path).body(Body::empty()).unwrap()).await;
     assert_eq!(served.status(), StatusCode::OK);
     assert_eq!(
         to_bytes(served.into_body(), usize::MAX).await.unwrap(),
