@@ -1,19 +1,17 @@
 use serde::{Deserialize, Serialize};
-use std::{fmt, str::FromStr};
+use std::fmt;
 
 const SHA256_BYTES: usize = 32;
-const SHA256_HEX_LEN: usize = SHA256_BYTES * 2;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Digest([u8; SHA256_BYTES]);
 
 impl Digest {
     pub fn parse(value: &str) -> Result<Self, IdentityError> {
-        if value.len() != SHA256_HEX_LEN
-            || value
-                .bytes()
-                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
-        {
+        // `decode_to_slice` already rejects a wrong length and any non-hex byte; only
+        // the canonical lowercase form is a valid identity, so uppercase hex — which
+        // decodes fine — has to be rejected separately.
+        if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
             return Err(IdentityError::InvalidDigest);
         }
 
@@ -46,14 +44,6 @@ impl fmt::Display for Digest {
     }
 }
 
-impl FromStr for Digest {
-    type Err = IdentityError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse(value)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactId {
     digest: Digest,
@@ -73,10 +63,6 @@ impl ArtifactId {
 
     pub fn from_digest(digest: Digest) -> Self {
         Self { digest }
-    }
-
-    pub fn algorithm(&self) -> &'static str {
-        Self::ALGORITHM
     }
 
     pub fn digest(&self) -> Digest {

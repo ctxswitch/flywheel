@@ -561,19 +561,18 @@ async fn serve_artifact(
     } else {
         RangeSelection::Full
     };
-    if range == RangeSelection::Unsatisfiable {
-        return Response::builder()
-            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_RANGE, format!("bytes */{content_len}"))
-            .header(header::ETAG, format!("\"{}\"", artifact))
-            .body(Body::empty())
-            .unwrap();
-    }
     let (start, end, length) = match range {
         RangeSelection::Partial { start, end } => (start, end, end - start + 1),
         RangeSelection::Full => (0, content_len.saturating_sub(1), content_len),
-        RangeSelection::Unsatisfiable => unreachable!("handled above"),
+        RangeSelection::Unsatisfiable => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_RANGE, format!("bytes */{content_len}"))
+                .header(header::ETAG, format!("\"{}\"", artifact))
+                .body(Body::empty())
+                .unwrap();
+        }
     };
     // A zstd-stored response is passed through untouched when the client accepts zstd;
     // otherwise it serves the complete logical bytes through the decoder.
@@ -734,7 +733,7 @@ async fn get_reference(
         .await
     {
         Ok(Some(record)) => Json(ArtifactBinding {
-            algorithm: record.artifact.algorithm().to_owned(),
+            algorithm: ArtifactId::ALGORITHM.to_owned(),
             digest: record.artifact.digest().to_string(),
         })
         .into_response(),
@@ -795,7 +794,7 @@ async fn delete_reference(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 enum RangeSelection {
     Full,
     Partial { start: u64, end: u64 },

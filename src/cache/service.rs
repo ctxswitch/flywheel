@@ -1,7 +1,8 @@
 use crate::{
     artifact::{ArtifactId, ArtifactMetadata, StoredEncoding},
+    cache::Mode,
     cache::recent_use::RecentUse,
-    cache::space::{Mode, SpaceLedger},
+    cache::space::SpaceLedger,
     cache::stripes::Stripes,
     channel::{ChannelGates, ChannelId, ChannelStoreError, Lifecycle},
     clock::Clock,
@@ -114,28 +115,17 @@ impl CacheService {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
-        match self.publish_impl(request).await? {
+        match self.publish_or_reject(request).await? {
             Admission::Published(publication) => Ok(publication),
             Admission::Rejected(_) => Err(CacheError::Local(LocalError::OutOfSpace)),
         }
     }
 
-    /// Content-addressed publication that hands the body back instead of failing when
-    /// the up-front reservation is rejected under disk pressure. The package proxy uses
-    /// this so a bypassed download streams the untouched body straight to the client —
-    /// never buffered, never re-fetched.
+    /// Publication that hands the body back instead of failing when the up-front
+    /// reservation is rejected under disk pressure. The package proxy uses this so a
+    /// bypassed download streams the untouched body straight to the client — never
+    /// buffered, never re-fetched.
     pub async fn publish_or_reject<S, E>(
-        &self,
-        request: PublishRequest<S>,
-    ) -> Result<Admission<S>, CacheError>
-    where
-        S: Stream<Item = Result<Bytes, E>> + Unpin,
-        E: std::fmt::Display,
-    {
-        self.publish_impl(request).await
-    }
-
-    async fn publish_impl<S, E>(
         &self,
         request: PublishRequest<S>,
     ) -> Result<Admission<S>, CacheError>
@@ -243,7 +233,6 @@ impl CacheService {
         durability: Durability,
     ) -> Result<(), CacheError> {
         let (_gate, _) = self.channel_fence(channel).await?;
-        let _stripe = self.stripes.reference(channel, &reference).await;
         self.metadata
             .bind_reference(
                 channel,
@@ -274,7 +263,6 @@ impl CacheService {
         reference: &str,
     ) -> Result<(), CacheError> {
         let (_gate, _) = self.channel_fence(channel).await?;
-        let _stripe = self.stripes.reference(channel, reference).await;
         self.metadata.delete_reference(channel, reference).await?;
         Ok(())
     }
