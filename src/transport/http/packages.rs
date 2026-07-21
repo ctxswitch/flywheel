@@ -69,7 +69,7 @@ async fn fetch_python_simple(
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok());
-    let Some(transform) = Transform::python_simple(context.route_prefix, path, accept) else {
+    let Some(transform) = Transform::python_simple(context.route_prefix(), path, accept) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
     };
     fetch(state, context.channel, Protocol::Python, path, transform).await
@@ -118,7 +118,7 @@ pub(super) async fn npm(
         &state,
         context.channel,
         &path.path,
-        context.route_prefix,
+        context.route_prefix(),
         accept,
     )
     .await
@@ -153,7 +153,7 @@ pub(super) async fn cargo_config(
         Err(response) => return response,
     };
     Json(serde_json::json!({
-        "dl": format!("{}/proxy/cargo/crates", context.route_prefix),
+        "dl": format!("{}/proxy/cargo/crates", context.route_prefix()),
         "api": null,
         "auth-required": context.access_control,
     }))
@@ -246,22 +246,17 @@ async fn outcome_response(
             )
             .await
         }
+        // The rewritten document is already materialized in memory, so there is no
+        // cache work left to admit and no reason to hold a foreground slot for the
+        // client's download.
         ProxyOutcome::CachedMetadata { body, content_type } => {
-            let Some(permit) = acquire_foreground(state) else {
-                return busy_response();
-            };
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_LENGTH, body.len());
             if let Some(content_type) = content_type {
                 builder = builder.header(header::CONTENT_TYPE, content_type);
             }
-            builder
-                .body(body_with_permit(
-                    futures_util::stream::iter([Ok::<_, std::io::Error>(body)]),
-                    permit,
-                ))
-                .unwrap()
+            builder.body(Body::from(body)).unwrap()
         }
         ProxyOutcome::Upstream {
             status,

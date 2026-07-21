@@ -63,10 +63,15 @@ impl RecentUse {
         channel.hash(&mut base);
         artifact.digest().as_bytes().hash(&mut base);
         let seed = base.finish();
+        // Kirsch-Mitzenmacher: two independent halves of the one hash generate every
+        // probe with the same false-positive behaviour as independent hashes, so a
+        // mark costs one hash instead of five. Forcing the step odd keeps it non-zero,
+        // so the probes never all collapse onto one slot.
+        let start = seed & 0xffff_ffff;
+        let step = (seed >> 32) | 1;
+        let bits = self.bits as u64;
         std::array::from_fn(|probe| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            (seed, probe as u64).hash(&mut hasher);
-            (hasher.finish() % self.bits as u64) as usize
+            (start.wrapping_add(step.wrapping_mul(probe as u64)) % bits) as usize
         })
     }
 }

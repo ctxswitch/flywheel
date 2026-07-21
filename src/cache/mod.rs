@@ -4,6 +4,8 @@ mod space;
 mod stripes;
 
 #[cfg(test)]
+mod recent_use_test;
+#[cfg(test)]
 mod space_test;
 
 pub use crate::artifact::StoredEncoding;
@@ -17,4 +19,4 @@ pub use service::{
     Admission, CacheError, CacheService, LocatedArtifact, Publication, PublicationOutcome,
     PublicationTarget, PublishRequest,
 };
-pub use space::{FreeSpace, Mode, SpaceLedger, SpacePolicy, StatvfsFreeSpace};
+pub use space::{FreeSpace, Mode, SpaceLedger, SpacePolicy, SpaceSnapshot, StatvfsFreeSpace};

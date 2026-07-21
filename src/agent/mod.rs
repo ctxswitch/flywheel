@@ -255,27 +255,29 @@ struct RoutedKey {
 }
 
 fn agent_request_span(request: &Request) -> tracing::Span {
-    let (operation, key, class) = match request.extensions().get::<MatchedPath>() {
-        Some(path) => (path.as_str().to_owned(), String::new(), "control"),
-        None => {
-            let routed = classify(request.method(), request.uri().path());
-            (routed.kind, routed.id, routed.class.as_str())
-        }
-    };
     let request_id = request
         .headers()
         .get(&REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("invalid");
-    tracing::info_span!(
+    let span = tracing::info_span!(
         "http_request",
         component = "agent",
         %request_id,
         method = %request.method(),
-        %operation,
-        %key,
-        class,
-    )
+        operation = tracing::field::Empty,
+        key = tracing::field::Empty,
+        class = tracing::field::Empty,
+    );
+    // A control route is identified by its matched path; every other request is
+    // classified once by the forwarder, which records these fields itself rather
+    // than making the span repeat the work.
+    if let Some(path) = request.extensions().get::<MatchedPath>() {
+        span.record("operation", path.as_str());
+        span.record("key", "");
+        span.record("class", "control");
+    }
+    span
 }
 
 /// Derives the routing object from a bare default-channel request path, mirroring the
@@ -332,17 +334,19 @@ async fn forward(State(state): State<Arc<AgentState>>, request: Request) -> Resp
         .headers()
         .get(REQUEST_PURPOSE_HEADER)
         .is_some_and(|value| value.as_bytes() == REQUEST_PURPOSE_PREFETCH.as_bytes());
-    let session = request
-        .headers()
-        .get(REQUEST_SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let configured_concurrency = request
-        .headers()
-        .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
+    // The session and concurrency headers are read only to describe a prefetch, so
+    // foreground traffic never parses them.
     let observation = prefetch.then(|| {
+        let session = request
+            .headers()
+            .get(REQUEST_SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let configured_concurrency = request
+            .headers()
+            .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
         AgentPrefetchObservation::start(Arc::clone(&state), session, configured_concurrency)
     });
     let started = Instant::now();
@@ -358,14 +362,19 @@ async fn forward(State(state): State<Arc<AgentState>>, request: Request) -> Resp
 }
 
 async fn forward_request(state: &Arc<AgentState>, request: Request, prefetch: bool) -> Response {
+    let routed = classify(request.method(), request.uri().path());
+    let span = tracing::Span::current();
+    span.record("operation", routed.kind.as_str());
+    span.record("key", routed.id.as_str());
+    span.record("class", routed.class.as_str());
     if request.uri().path() == "/channels" || request.uri().path().starts_with("/channels/") {
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
-    let routed = classify(request.method(), request.uri().path());
     let Some(position) = ring::key_position(&routed.kind, &routed.id) else {
         return StatusCode::URI_TOO_LONG.into_response();
     };
-    let Some(owner) = state.ring.ring().owner(position).cloned() else {
+    let ring = state.ring.ring();
+    let Some(owner) = ring.owner(position) else {
         if prefetch {
             state.metrics.prefetch_unavailable.inc();
         }
@@ -376,17 +385,17 @@ async fn forward_request(state: &Arc<AgentState>, request: Request, prefetch: bo
         .path_and_query()
         .map_or("/", |path_and_query| path_and_query.as_str());
     let url = format!("http://{}{}", owner.address, path_and_query);
-    let method = request.method().clone();
-    let reqwest_method =
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).expect("method round-trips");
     let (parts, body) = request.into_parts();
-    let mut upstream = state.client.request(reqwest_method, url);
+    // Axum and reqwest share one `http` crate, so the inbound method is the outbound
+    // method — no textual round-trip.
+    let bodyless = matches!(parts.method, Method::GET | Method::HEAD);
+    let mut upstream = state.client.request(parts.method, url);
     for (name, value) in &parts.headers {
         if !skip_request_header(name.as_str()) {
             upstream = upstream.header(name.as_str(), value.as_bytes());
         }
     }
-    if !matches!(method, Method::GET | Method::HEAD) {
+    if !bodyless {
         upstream = upstream.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     }
     match upstream.send().await {
@@ -408,7 +417,7 @@ async fn forward_request(state: &Arc<AgentState>, request: Request, prefetch: bo
         }
         Err(error) => {
             tracing::warn!(%error, owner = owner.id, "forwarded request failed");
-            record_send_failure(state, &owner, &error);
+            record_send_failure(state, owner, &error);
             if prefetch {
                 state.metrics.prefetch_unavailable.inc();
             }
