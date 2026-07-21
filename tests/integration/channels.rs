@@ -12,11 +12,10 @@ use rocksdb::{DB, IteratorMode, Options};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
-use tower::ServiceExt;
 
-async fn call(app: axum::Router, request: Request<Body>) -> axum::response::Response {
-    app.oneshot(request).await.unwrap()
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::call;
 
 async fn register(app: axum::Router, protected: bool) -> Value {
     let response = call(
