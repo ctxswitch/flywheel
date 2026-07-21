@@ -280,7 +280,9 @@ where
     )
     .await;
     if args.ephemeral_cache {
-        tokio::fs::remove_dir_all(&directory).await?;
+        // Best-effort, like `prune_stale_files`: a cleanup failure after a successful
+        // build would otherwise exit non-zero, which Go reports as a cache error.
+        let _ = tokio::fs::remove_dir_all(&directory).await;
     } else {
         let object_max_age =
             (args.prune_days > 0).then(|| Duration::from_secs(args.prune_days * 24 * 60 * 60));

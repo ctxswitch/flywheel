@@ -29,6 +29,10 @@ pub struct Config {
 }
 
 impl Config {
+    /// Defaults for embedders and tests. The serve command does not go through here:
+    /// clap owns the operator-facing defaults in `cli.rs` (`#[arg(default_value_t)]`)
+    /// and `ServeArgs::config` builds the whole struct, so the two default sets are
+    /// deliberately separate and must be changed together.
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),

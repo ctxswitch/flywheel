@@ -102,35 +102,32 @@ pub struct ServeArgs {
 }
 
 impl ServeArgs {
-    pub fn config(&self) -> Config {
-        let mut config = Config::new(&self.data_dir);
-        config.max_upload_bytes = self.max_upload_bytes;
-        config.default_expiry_seconds = self.default_expiry_seconds;
-        config.foreground_concurrency = self.foreground_concurrency;
-        config.reservation_extent_bytes = self.reservation_extent_bytes;
-        config.low_watermark_bytes = self.low_watermark_bytes;
-        config.high_watermark_bytes = self.high_watermark_bytes;
-        config.emergency_headroom_bytes = self.emergency_headroom_bytes;
-        config.bloom_bits = self.bloom_bits;
-        config.reclaim_candidate_limit = self.reclaim_candidate_limit;
-        config.reclaim_byte_limit = self.reclaim_byte_limit;
-        config.orphan_scan_limit = self.orphan_scan_limit;
-        config.go_upstream.clone_from(&self.go_upstream);
-        config.python_upstream.clone_from(&self.python_upstream);
-        config.npm_upstream.clone_from(&self.npm_upstream);
-        config
-            .cargo_index_upstream
-            .clone_from(&self.cargo_index_upstream);
-        config
-            .cargo_crate_upstream
-            .clone_from(&self.cargo_crate_upstream);
-        config.proxy_revalidation_seconds = self.proxy_revalidation_seconds;
-        config.proxy_concurrency = self.proxy_concurrency;
-        config.upstream_timeout_seconds = self.upstream_timeout_seconds;
-        config
-            .proxy_allowed_origins
-            .clone_from(&self.proxy_allowed_origins);
-        config
+    /// Names every `Config` field rather than overwriting `Config::new`'s defaults, so
+    /// a field added to `Config` is a compile error here instead of a silent default.
+    pub fn config(self) -> Config {
+        Config {
+            data_dir: self.data_dir,
+            max_upload_bytes: self.max_upload_bytes,
+            default_expiry_seconds: self.default_expiry_seconds,
+            go_upstream: self.go_upstream,
+            python_upstream: self.python_upstream,
+            npm_upstream: self.npm_upstream,
+            cargo_index_upstream: self.cargo_index_upstream,
+            cargo_crate_upstream: self.cargo_crate_upstream,
+            proxy_revalidation_seconds: self.proxy_revalidation_seconds,
+            proxy_concurrency: self.proxy_concurrency,
+            upstream_timeout_seconds: self.upstream_timeout_seconds,
+            proxy_allowed_origins: self.proxy_allowed_origins,
+            foreground_concurrency: self.foreground_concurrency,
+            reservation_extent_bytes: self.reservation_extent_bytes,
+            low_watermark_bytes: self.low_watermark_bytes,
+            high_watermark_bytes: self.high_watermark_bytes,
+            emergency_headroom_bytes: self.emergency_headroom_bytes,
+            bloom_bits: self.bloom_bits,
+            reclaim_candidate_limit: self.reclaim_candidate_limit,
+            reclaim_byte_limit: self.reclaim_byte_limit,
+            orphan_scan_limit: self.orphan_scan_limit,
+        }
     }
 }
 
