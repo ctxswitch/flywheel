@@ -179,8 +179,6 @@ where
         args.prefetch_concurrency,
         Arc::clone(&session_state),
     )));
-    let mut session_finished = false;
-
     write_response(
         &mut writer,
         &Response {
@@ -206,7 +204,6 @@ where
         {
             finish_session(
                 &mut prefetch_task,
-                &mut session_finished,
                 &client,
                 &base,
                 args.token.as_deref(),
@@ -288,7 +285,6 @@ where
     }
     finish_session(
         &mut prefetch_task,
-        &mut session_finished,
         &client,
         &base,
         args.token.as_deref(),
@@ -306,20 +302,18 @@ where
     Ok(())
 }
 
-/// Ends the session exactly once: stop predicting, then persist what this build
-/// used so the next one can prefetch it.
+/// Ends the session: stop predicting, then persist what this build used so the next
+/// one can prefetch it. Both halves are idempotent — the join handle is taken out of
+/// the option and `finalize` drains the usage map — so the close path calling this and
+/// then falling through to the same call after the loop costs nothing.
 async fn finish_session(
     task: &mut Option<tokio::task::JoinHandle<()>>,
-    finished: &mut bool,
     client: &reqwest::Client,
     base: &reqwest::Url,
     token: Option<&str>,
     manifest_key: &str,
     state: &SessionState,
 ) {
-    if std::mem::replace(finished, true) {
-        return;
-    }
     if let Some(task) = task.take() {
         task.abort();
         let _ = task.await;

@@ -133,13 +133,6 @@ impl SpaceLedger {
         state.free_observed.saturating_sub(spoken_for)
     }
 
-    /// Bytes available for new staging reservations after subtracting outstanding
-    /// reservations, bytes committed since the last observation, and headroom.
-    pub fn available(&self) -> u64 {
-        let state = self.state.lock().expect("space ledger poisoned");
-        self.available_locked(&state)
-    }
-
     /// The current maintenance mode using low/high watermark hysteresis.
     pub fn mode(&self) -> Mode {
         let mut state = self.state.lock().expect("space ledger poisoned");
@@ -163,24 +156,6 @@ impl SpaceLedger {
     /// reports this so a node with a failing statvfs advertises itself as not ready.
     pub fn degraded(&self) -> bool {
         self.state.lock().expect("space ledger poisoned").degraded
-    }
-
-    pub fn free_observed(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("space ledger poisoned")
-            .free_observed
-    }
-
-    pub fn reserved(&self) -> u64 {
-        self.state.lock().expect("space ledger poisoned").reserved
-    }
-
-    pub fn committed_since(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("space ledger poisoned")
-            .committed_since
     }
 
     /// The three published counters read together, so the exported gauges describe one

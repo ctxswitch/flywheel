@@ -19,4 +19,5 @@ pub use service::{
     Admission, CacheError, CacheService, LocatedArtifact, Publication, PublicationOutcome,
     PublicationTarget, PublishRequest,
 };
-pub use space::{FreeSpace, Mode, SpaceLedger, SpacePolicy, SpaceSnapshot, StatvfsFreeSpace};
+pub(crate) use space::Mode;
+pub use space::{FreeSpace, SpaceLedger, SpacePolicy, SpaceSnapshot, StatvfsFreeSpace};

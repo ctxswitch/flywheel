@@ -20,8 +20,9 @@ pub(crate) struct RecentUse {
 
 impl RecentUse {
     pub(crate) fn new(bits: usize) -> Self {
-        // Round up to whole 64-bit words, with a floor so the filter is never empty.
-        let words = bits.div_ceil(64).max(1);
+        // Round up to whole 64-bit words. `Config::validate` rejects a zero width, so
+        // the filter is never empty.
+        let words = bits.div_ceil(64);
         Self {
             filters: [new_words(words), new_words(words)],
             bits: words * 64,

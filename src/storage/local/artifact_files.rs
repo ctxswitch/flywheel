@@ -88,31 +88,6 @@ fn schedule_removal(path: PathBuf, settlement: PendingSettlement) {
     });
 }
 
-/// Makes an explicitly awaited discard cancellation-safe. If its caller is dropped
-/// while the async unlink is pending, this guard schedules one best-effort retry using
-/// the same conservative accounting fallback as `Reservation::drop`.
-struct AwaitedRemoval {
-    path: Option<PathBuf>,
-    settlement: Option<PendingSettlement>,
-}
-
-impl AwaitedRemoval {
-    async fn run(mut self) {
-        let result = tokio::fs::remove_file(self.path.as_ref().expect("path is present")).await;
-        self.path.take();
-        let settlement = self.settlement.take().expect("settlement is present");
-        settle_removal(result, settlement);
-    }
-}
-
-impl Drop for AwaitedRemoval {
-    fn drop(&mut self) {
-        if let (Some(path), Some(settlement)) = (self.path.take(), self.settlement.take()) {
-            schedule_removal(path, settlement);
-        }
-    }
-}
-
 impl Reservation {
     fn new(reserver: Arc<dyn Reserver>) -> Self {
         Self {
@@ -164,21 +139,16 @@ impl Reservation {
         self.state = ReservationState::Published;
     }
 
-    /// Settles a failed operation before returning to its caller. Temporary files are
-    /// removed asynchronously; successful deletion and `NotFound` release the capacity,
-    /// while deletion failure or a published file commits it until refresh.
+    /// Settles a failed operation before returning to its caller. Successful deletion
+    /// of the temporary file and `NotFound` release the capacity, while deletion
+    /// failure or a published file commits it until refresh.
     pub(crate) async fn discard(mut self) {
         let state = std::mem::replace(&mut self.state, ReservationState::Vacant);
         let settlement = self.settlement();
         match state {
             ReservationState::Vacant => settlement.release(),
             ReservationState::Temporary(path) => {
-                AwaitedRemoval {
-                    path: Some(path),
-                    settlement: Some(settlement),
-                }
-                .run()
-                .await;
+                settle_removal(tokio::fs::remove_file(path).await, settlement);
             }
             ReservationState::Published => settlement.commit(),
         }
@@ -232,11 +202,6 @@ pub enum FilePublication {
 enum StageWriter {
     Identity(tokio::fs::File),
     Zstd(ZstdEncoder<tokio::fs::File>),
-}
-
-enum PublishedBody {
-    Created,
-    Existing,
 }
 
 impl StageWriter {
@@ -433,7 +398,7 @@ impl ArtifactFiles {
             mut reservation,
             ..
         } = staged;
-        let published = match self
+        let created = match self
             .publish_reserved(
                 channel,
                 artifact,
@@ -444,20 +409,22 @@ impl ArtifactFiles {
             )
             .await
         {
-            Ok(published) => published,
+            Ok(created) => created,
             Err(error) => {
                 reservation.discard().await;
                 return Err(error);
             }
         };
-        Ok(match published {
-            PublishedBody::Created => FilePublication::Created(reservation),
-            PublishedBody::Existing => FilePublication::Existing(reservation),
+        Ok(if created {
+            FilePublication::Created(reservation)
+        } else {
+            FilePublication::Existing(reservation)
         })
     }
 
     /// Performs the fallible pre-publication and rename work, leaving one awaited
-    /// discard site in `publish` for every ordinary failure.
+    /// discard site in `publish` for every ordinary failure. Returns whether this call
+    /// installed the body, as opposed to finding it already published.
     async fn publish_reserved(
         &self,
         channel: ChannelId,
@@ -466,7 +433,7 @@ impl ArtifactFiles {
         digest: Digest,
         reservation: &mut Reservation,
         durability: Durability,
-    ) -> Result<PublishedBody, LocalError> {
+    ) -> Result<bool, LocalError> {
         if digest != artifact.digest() {
             return Err(LocalError::DigestMismatch);
         }
@@ -476,14 +443,14 @@ impl ArtifactFiles {
         if tokio::fs::try_exists(&final_path).await? {
             tokio::fs::remove_file(staged_path).await?;
             reservation.mark_vacant();
-            return Ok(PublishedBody::Existing);
+            return Ok(false);
         }
         match tokio::fs::rename(staged_path, &final_path).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 tokio::fs::remove_file(staged_path).await?;
                 reservation.mark_vacant();
-                return Ok(PublishedBody::Existing);
+                return Ok(false);
             }
             Err(error) => return Err(error.into()),
         }
@@ -502,7 +469,7 @@ impl ArtifactFiles {
                     .and_then(|result| result.map_err(LocalError::from));
             synced?;
         }
-        Ok(PublishedBody::Created)
+        Ok(true)
     }
 
     pub fn path(&self, channel: ChannelId, artifact: ArtifactId) -> PathBuf {

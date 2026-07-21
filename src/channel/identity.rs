@@ -9,12 +9,7 @@ impl ChannelId {
     pub const DEFAULT: Self = Self(Ulid::nil());
 
     pub fn new() -> Self {
-        loop {
-            let id = Self(Ulid::new());
-            if id != Self::DEFAULT {
-                return id;
-            }
-        }
+        Self(Ulid::new())
     }
 
     /// The channel's durable key prefix: the canonical ULID text, encoded straight

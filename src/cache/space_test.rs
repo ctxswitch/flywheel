@@ -31,14 +31,14 @@ fn concurrent_reservations_never_double_spend_the_same_capacity() {
     assert!(ledger.try_reserve(60));
     assert!(ledger.try_reserve(40));
     assert!(!ledger.try_reserve(1));
-    assert_eq!(ledger.reserved(), 100);
+    assert_eq!(ledger.snapshot().reserved, 100);
 
     // Committing frees the reservation slot but keeps the bytes accounted until the
     // next filesystem observation.
     ledger.commit(60);
-    assert_eq!(ledger.reserved(), 40);
+    assert_eq!(ledger.snapshot().reserved, 40);
     assert!(!ledger.try_reserve(1));
-    assert_eq!(ledger.committed_since(), 60);
+    assert_eq!(ledger.snapshot().committed_since, 60);
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn refresh_failure_retains_last_observation_but_stops_reservations() {
     fail.store(true, Ordering::SeqCst);
     ledger.refresh();
     assert!(ledger.degraded());
-    assert_eq!(ledger.free_observed(), 100);
+    assert_eq!(ledger.snapshot().free_observed, 100);
     assert!(!ledger.try_reserve(1));
 
     // Recovery clears the degraded state.

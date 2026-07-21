@@ -19,10 +19,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::{io::AsyncWriteExt, sync::watch};
@@ -224,10 +221,7 @@ pub fn unix_now() -> u64 {
 
 /// The hex digest naming the empty body: every zero-size action resolves to this
 /// one output, so a single synthesized empty file answers all of them locally.
-fn empty_output() -> &'static str {
-    static EMPTY: OnceLock<String> = OnceLock::new();
-    EMPTY.get_or_init(|| hex::encode(Sha256::digest([])))
-}
+const EMPTY_OUTPUT: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// The startup task: fetch the stored manifest by its cache key — the same plain
 /// GET `finalize` issues — then warm the object directory with bounded parallel
@@ -289,7 +283,7 @@ async fn prefetch(
             // file locally instead of downloading nothing over the network. A
             // zero-size entry under any other digest can never verify, so it is
             // dropped from the work list entirely.
-            if entry.output == empty_output() {
+            if entry.output == EMPTY_OUTPUT {
                 super::write_disk_file(directory, &entry.output, &[]).await?;
                 local += 1;
             }
@@ -320,14 +314,10 @@ async fn prefetch(
     }
 
     let limit = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let active = AtomicUsize::new(0);
-    let peak = AtomicUsize::new(0);
     let mut downloads: FuturesUnordered<_> = wanted
         .iter()
         .map(|&(action, entry)| {
             let limit = Arc::clone(&limit);
-            let active = &active;
-            let peak = &peak;
             // Register before the download queues behind the concurrency bound so
             // a foreground get for any wanted output — queued or actively
             // downloading — waits for the pool instead of duplicating the fetch.
@@ -338,24 +328,18 @@ async fn prefetch(
                     .acquire_owned()
                     .await
                     .expect("prefetch semaphore is never closed");
-                let running = active.fetch_add(1, Ordering::Relaxed) + 1;
-                peak.fetch_max(running, Ordering::Relaxed);
-                let outcome = download_object(
+                match download_object(
                     client,
                     base,
                     token,
                     directory,
-                    PredictedObject {
-                        session_label: manifest_key,
-                        concurrency,
-                        action,
-                        entry,
-                    },
+                    manifest_key,
+                    concurrency,
+                    (action, entry),
                 )
-                .await;
-                active.fetch_sub(1, Ordering::Relaxed);
-                match outcome {
-                    Ok(fetched) => Some(fetched),
+                .await
+                {
+                    Ok(published) => published,
                     Err(error) => {
                         // Every per-object failure is just a future foreground miss.
                         tracing::debug!(%error, "prefetch download skipped");
@@ -368,76 +352,57 @@ async fn prefetch(
     let attempted = downloads.len();
     let mut downloaded = 0usize;
     let mut bytes = 0u64;
-    let mut published_meanwhile = 0usize;
-    while let Some(result) = downloads.next().await {
-        match result {
-            Some(Fetched::Published(size)) => {
-                downloaded += 1;
-                bytes += size;
-            }
-            Some(Fetched::AlreadyLocal) => published_meanwhile += 1,
-            Some(Fetched::Miss) | None => {}
+    while let Some(published) = downloads.next().await {
+        if let Some(size) = published {
+            downloaded += 1;
+            bytes += size;
         }
     }
     drop(downloads);
     tracing::debug!(
         advertised,
-        local = local + published_meanwhile,
+        local,
         attempted,
         downloaded,
-        missed = attempted - downloaded - published_meanwhile,
+        missed = attempted - downloaded,
         bytes,
         duration_ms = started.elapsed().as_millis() as u64,
-        peak_concurrency = peak.load(Ordering::Relaxed),
         "build-cache prefetch complete"
     );
     Ok(())
 }
 
-enum Fetched {
-    /// Downloaded, verified, and published, carrying the object size.
-    Published(u64),
-    /// A foreground get published the object while this download was queued.
-    AlreadyLocal,
-    /// The server does not hold the object.
-    Miss,
-}
-
-struct PredictedObject<'a> {
-    session_label: &'a str,
-    concurrency: usize,
-    action: &'a str,
-    entry: &'a ManifestEntry,
-}
-
-/// Downloads one predicted object through the ordinary cache route — the exact GET
-/// a foreground miss would issue, plus the telemetry purpose header — verifying
-/// size and digest against the manifest entry before publishing it into the local
-/// object directory.
+/// Downloads one predicted `(action, entry)` through the ordinary cache route — the
+/// exact GET a foreground miss would issue, plus the telemetry purpose header —
+/// verifying size and digest against the manifest entry before publishing it into
+/// the local object directory. Returns the object's size when this call published
+/// it, and `None` when the server does not hold it or a foreground get won the race.
 async fn download_object(
     client: &reqwest::Client,
     base: &reqwest::Url,
     token: Option<&str>,
     directory: &Path,
-    object: PredictedObject<'_>,
-) -> anyhow::Result<Fetched> {
-    let path = directory.join(&object.entry.output);
+    manifest_key: &str,
+    concurrency: usize,
+    (action, entry): (&str, &ManifestEntry),
+) -> anyhow::Result<Option<u64>> {
+    let path = directory.join(&entry.output);
     // The work list was computed at startup; a foreground get may have published
     // this object while the download waited behind the concurrency bound.
-    if super::file_has_size(&path, object.entry.size).await {
-        return Ok(Fetched::AlreadyLocal);
+    if super::file_has_size(&path, entry.size).await {
+        return Ok(None);
     }
     let mut request = client
-        .get(base.join(&format!("go-{}", object.action))?)
+        .get(base.join(&format!("go-{action}"))?)
         .header(REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH)
-        .header(REQUEST_PREFETCH_CONCURRENCY_HEADER, object.concurrency)
-        .header(REQUEST_SESSION_HEADER, object.session_label);
+        .header(REQUEST_PREFETCH_CONCURRENCY_HEADER, concurrency)
+        .header(REQUEST_SESSION_HEADER, manifest_key);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
     let response = request.send().await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(Fetched::Miss);
+        return Ok(None);
     }
     anyhow::ensure!(
         response.status().is_success(),
@@ -445,7 +410,7 @@ async fn download_object(
         response.status()
     );
     let temporary = super::temporary_path(directory);
-    if let Err(error) = spool_verified(response, &temporary, object.entry).await {
+    if let Err(error) = spool_verified(response, &temporary, entry).await {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error);
     }
@@ -455,7 +420,7 @@ async fn download_object(
             return Err(error.into());
         }
     }
-    Ok(Fetched::Published(object.entry.size))
+    Ok(Some(entry.size))
 }
 
 /// Streams the response body into the temporary file while hashing incrementally,

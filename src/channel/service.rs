@@ -89,13 +89,10 @@ impl ChannelService {
                 }
             }
         };
-        if record.id != ChannelId::DEFAULT
-            || record.access != Access::Open
-            || record.state != Lifecycle::Active
-        {
+        if record.access != Access::Open || record.state != Lifecycle::Active {
             return Err(ChannelError::InvalidDefault);
         }
-        self.gate(ChannelId::DEFAULT);
+        self.gates.gate(ChannelId::DEFAULT);
         Ok(())
     }
 
@@ -115,7 +112,7 @@ impl ChannelService {
             created_at: unix_time(),
         };
         self.store.create_channel(record.clone()).await?;
-        self.gate(record.id);
+        self.gates.gate(record.id);
         Ok(IssuedChannel { record, token })
     }
 
@@ -131,7 +128,7 @@ impl ChannelService {
         if record.state != Lifecycle::Active {
             return Err(ChannelError::Deleting);
         }
-        let guard = self.gate(id).read_owned().await;
+        let guard = self.gates.gate(id).read_owned().await;
         let Some(current) = self.store.channel(id).await? else {
             return Err(ChannelError::NotFound);
         };
@@ -187,14 +184,16 @@ impl ChannelService {
         self.store.store_channel(deleting).await?;
         drop(lease);
 
-        let gate = self.gate(id);
+        let gate = self.gates.gate(id);
         let _exclusive = gate.write().await;
         self.finish_deletion(id).await
     }
 
     pub async fn resume_deletions(&self) -> Result<(), ChannelError> {
-        for channel in self.store.deleting_channels().await? {
-            let gate = self.gate(channel.id);
+        let mut deleting = self.store.channels().await?;
+        deleting.retain(|channel| channel.state == Lifecycle::Deleting);
+        for channel in deleting {
+            let gate = self.gates.gate(channel.id);
             let _exclusive = gate.write().await;
             self.finish_deletion(channel.id).await?;
         }
@@ -207,10 +206,6 @@ impl ChannelService {
         self.store.finish_channel_deletion(id).await?;
         self.gates.forget(id);
         Ok(())
-    }
-
-    fn gate(&self, id: ChannelId) -> Arc<RwLock<()>> {
-        self.gates.gate(id)
     }
 }
 
