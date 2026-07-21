@@ -2,10 +2,8 @@ name: Release
 
 on:
   workflow_dispatch:
-  workflow_run:
-    workflows: ["Bump Version"]
-    types:
-      - completed
+  push:
+    branches: [main]
 
 permissions:
   contents: write
@@ -14,32 +12,50 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   resolve-tag:
     name: Resolve Tag
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      release: ${{ steps.tag.outputs.release }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get latest tag
+      - name: Resolve release tag
         id: tag
         run: |
-          tag=$(git tag --sort=-v:refname | grep '^v' | head -1)
-          if [ -z "$tag" ]; then
-            echo "::error::No version tag found"
-            exit 1
+          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          tag="v${version}"
+
+          if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              echo "Tag $tag already exists; there is nothing to release."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "release=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag "$tag"
+            git push origin "$tag"
+            echo "release=true" >> "$GITHUB_OUTPUT"
           fi
+
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Resolved tag: $tag"
 
   ci:
     name: CI
     needs: [resolve-tag]
+    if: needs.resolve-tag.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +74,7 @@ jobs:
   docker:
     name: Docker
     needs: [resolve-tag, ci]
+    if: needs.resolve-tag.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +103,7 @@ jobs:
   helm:
     name: Helm Chart
     needs: [resolve-tag, docker]
+    if: needs.resolve-tag.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -131,6 +149,7 @@ jobs:
   release:
     name: GitHub Release
     needs: [resolve-tag, docker, helm]
+    if: needs.resolve-tag.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
