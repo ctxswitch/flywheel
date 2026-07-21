@@ -27,7 +27,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{io::SeekFrom, sync::Arc, time::Instant};
+use std::{borrow::Cow, io::SeekFrom, sync::Arc, time::Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tower::ServiceBuilder;
@@ -141,7 +141,10 @@ fn server_request_span(request: &Request) -> tracing::Span {
     )
 }
 
-fn server_request_identity(request: &Request) -> (String, String) {
+/// The span's operation and key for one request. Both borrow out of the request
+/// wherever the path already holds the text; only the multi-segment proxy key is
+/// assembled.
+fn server_request_identity(request: &Request) -> (&str, Cow<'_, str>) {
     let path = request.uri().path();
     let raw_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let segments = match raw_segments.as_slice() {
@@ -149,21 +152,20 @@ fn server_request_identity(request: &Request) -> (String, String) {
         rest => rest,
     };
     match segments {
-        ["artifacts", _algorithm, digest] => ("artifact".to_owned(), (*digest).to_owned()),
-        ["build-cache", "bazel", "cas", hash] => ("artifact".to_owned(), (*hash).to_owned()),
-        ["build-cache", "bazel", "ac", hash] => ("bazel-action".to_owned(), (*hash).to_owned()),
-        ["build-cache", "http", key] => ("http-cache".to_owned(), (*key).to_owned()),
-        ["references", reference] => ("reference".to_owned(), (*reference).to_owned()),
+        ["artifacts", _algorithm, digest] => ("artifact", Cow::Borrowed(*digest)),
+        ["build-cache", "bazel", "cas", hash] => ("artifact", Cow::Borrowed(*hash)),
+        ["build-cache", "bazel", "ac", hash] => ("bazel-action", Cow::Borrowed(*hash)),
+        ["build-cache", "http", key] => ("http-cache", Cow::Borrowed(*key)),
+        ["references", reference] => ("reference", Cow::Borrowed(*reference)),
         ["proxy", protocol, rest @ ..] if !rest.is_empty() => {
-            ((*protocol).to_owned(), rest.join("/"))
+            (*protocol, Cow::Owned(rest.join("/")))
         }
         _ => (
             request
                 .extensions()
                 .get::<MatchedPath>()
-                .map_or("unmatched", MatchedPath::as_str)
-                .to_owned(),
-            String::new(),
+                .map_or("unmatched", MatchedPath::as_str),
+            Cow::Borrowed(""),
         ),
     }
 }
@@ -241,7 +243,9 @@ struct HashPath {
 
 pub(super) struct ChannelContext {
     pub channel: ChannelId,
-    pub route_prefix: String,
+    /// Set only when the request came in under an explicit `/channels/{id}` prefix.
+    /// The bare routes resolve to the default channel and carry no prefix.
+    scope: Option<ChannelId>,
     pub access_control: bool,
 }
 
@@ -254,16 +258,24 @@ impl ChannelContext {
         let Some(channel) = channel else {
             return Ok(Self {
                 channel: ChannelId::DEFAULT,
-                route_prefix: String::new(),
+                scope: None,
                 access_control: false,
             });
         };
         let record = authorize_channel(state, channel, headers).await?;
         Ok(Self {
             channel: record.id,
-            route_prefix: format!("/channels/{}", record.id),
+            scope: Some(record.id),
             access_control: record.access.is_protected(),
         })
+    }
+
+    /// The path prefix rewritten package URLs must carry to route back to this
+    /// channel. Only the package-proxy handlers rewrite URLs, so it is built on
+    /// demand rather than on every request.
+    pub(super) fn route_prefix(&self) -> String {
+        self.scope
+            .map_or_else(String::new, |channel| format!("/channels/{channel}"))
     }
 }
 
@@ -308,21 +320,23 @@ async fn count_request(
         .headers()
         .get(REQUEST_PURPOSE_HEADER)
         .is_some_and(|value| value.as_bytes() == REQUEST_PURPOSE_PREFETCH.as_bytes());
-    let session = request
-        .headers()
-        .get(REQUEST_SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let configured_concurrency = request
-        .headers()
-        .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
+    // The session and concurrency headers are read only to describe a prefetch, so
+    // foreground traffic never parses them.
     let observation = prefetch.then(|| {
+        let session = request
+            .headers()
+            .get(REQUEST_SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let configured_concurrency = request
+            .headers()
+            .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
         PrefetchObservation::start(
             Arc::clone(&metrics),
             route.clone(),
-            session.clone(),
+            session,
             configured_concurrency,
         )
     });
@@ -332,7 +346,7 @@ async fn count_request(
     metrics.observe_http_request(
         method.as_str(),
         &route,
-        response.status().as_u16(),
+        response.status(),
         response_headers_duration,
     );
     match observation {
@@ -675,7 +689,7 @@ async fn put_reference(
     };
     match state
         .cache
-        .bind_reference(context.channel, reference.to_string(), artifact)
+        .bind_reference(context.channel, reference.into_string(), artifact)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1113,7 +1127,7 @@ async fn put_http_cache(
         Ok(context) => context,
         Err(response) => return response,
     };
-    if Reference::parse(&path.key).is_err() {
+    if !Reference::is_valid(&path.key) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let Some(_permit) = acquire_foreground(&state) else {
@@ -1307,9 +1321,9 @@ async fn get_bazel_ac(
         Ok(context) => context,
         Err(response) => return response,
     };
-    if ArtifactId::parse("sha256", &path.hash).is_err() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
+    // No hex validation on the read: an unparseable hash cannot name a stored action
+    // result either, so it takes the same reference lookup and misses, exactly as the
+    // HTTP build-cache read does.
     serve_reference_artifact(
         state,
         context.channel,

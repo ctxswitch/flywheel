@@ -434,12 +434,12 @@ async fn get(
         // of downloading the same bytes again: Go's own build parallelism bounds
         // the waiters, and the signal fires however the download ends, so a
         // failed one simply falls through to the ordinary request below.
-        if !file_has_size(&path, entry.size).await
-            && let Some(mut pending) = session.download_in_progress(&entry.output)
-        {
+        let mut present = file_has_size(&path, entry.size).await;
+        if !present && let Some(mut pending) = session.download_in_progress(&entry.output) {
             let _ = pending.changed().await;
+            present = file_has_size(&path, entry.size).await;
         }
-        if file_has_size(&path, entry.size).await {
+        if present {
             touch(&path);
             // A local answer is still a use: without this the manifest retains the
             // entry against its stale `last_seen`, so the best-predicted actions
@@ -466,7 +466,7 @@ async fn get(
         .get(reqwest::header::ETAG)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body = response.bytes().await?.to_vec();
+    let body = response.bytes().await?;
     // The put-side check guarantees the stored body's hash IS the output ID.
     let output = hex::encode(Sha256::digest(&body));
     if let Some(expected) = etag

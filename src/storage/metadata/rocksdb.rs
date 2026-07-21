@@ -149,7 +149,10 @@ impl RocksMetadata {
                 );
             }
             batch.delete_cf(&artifacts, &key);
-            write_sync(&database, batch)
+            // The same delete `evict` performs, and for the same reason it needs no
+            // fsync: losing the removal leaves a metadata row whose body is already
+            // gone, which the read path self-heals into a miss.
+            database.write(batch).map_err(store_error)
         })
         .await
     }
@@ -159,6 +162,7 @@ impl RocksMetadata {
         channel: ChannelId,
         reference: String,
         record: ReferenceRecord,
+        durability: Durability,
     ) -> Result<(), MetadataError> {
         let database = Arc::clone(&self.database);
         blocking(move || {
@@ -173,7 +177,7 @@ impl RocksMetadata {
                 reference_key(channel, &reference),
                 encode_record(&record)?,
             );
-            write_sync(&database, batch)
+            write(&database, batch, durability)
         })
         .await
     }
@@ -467,21 +471,31 @@ fn write_sync(database: &DB, batch: WriteBatch) -> Result<(), MetadataError> {
 }
 
 fn artifact_key(channel: ChannelId, artifact: ArtifactId) -> Vec<u8> {
-    let mut key = channel.as_key().to_vec();
-    key.extend_from_slice(artifact.digest().as_bytes());
+    let prefix = channel.as_key();
+    let digest = artifact.digest();
+    let digest = digest.as_bytes();
+    let mut key = Vec::with_capacity(prefix.len() + digest.len());
+    key.extend_from_slice(&prefix);
+    key.extend_from_slice(digest);
     key
 }
 
 fn reference_key(channel: ChannelId, reference: &str) -> Vec<u8> {
-    let mut key = channel.as_key().to_vec();
+    let prefix = channel.as_key();
+    let mut key = Vec::with_capacity(prefix.len() + reference.len());
+    key.extend_from_slice(&prefix);
     key.extend_from_slice(reference.as_bytes());
     key
 }
 
 fn eviction_key(channel: ChannelId, eligible_at: u64, artifact: ArtifactId) -> Vec<u8> {
-    let mut key = channel.as_key().to_vec();
+    let prefix = channel.as_key();
+    let digest = artifact.digest();
+    let digest = digest.as_bytes();
+    let mut key = Vec::with_capacity(prefix.len() + 8 + digest.len());
+    key.extend_from_slice(&prefix);
     key.extend_from_slice(&eligible_at.to_be_bytes());
-    key.extend_from_slice(artifact.digest().as_bytes());
+    key.extend_from_slice(digest);
     key
 }
 
