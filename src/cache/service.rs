@@ -361,12 +361,11 @@ impl CacheService {
                 // candidate row is not stale before anything is unlinked; under the
                 // stripe nothing can requeue or republish in between (`commit_staged`
                 // takes the same stripe), so `evict` then removes the row it just saw.
-                match self.metadata.artifact(channel, candidate.artifact).await? {
-                    Some(metadata) if metadata.eligible_at == candidate.eligible_at => {
-                        self.files.remove(channel, candidate.artifact).await?;
-                    }
-                    // Requeued or already gone: let `evict` drop the stale queue row.
-                    _ => {}
+                // Requeued or already gone: let `evict` drop the stale queue row.
+                if let Some(metadata) = self.metadata.artifact(channel, candidate.artifact).await?
+                    && metadata.eligible_at == candidate.eligible_at
+                {
+                    self.files.remove(channel, candidate.artifact).await?;
                 }
                 match self
                     .metadata
