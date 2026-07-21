@@ -3,19 +3,16 @@ use crate::proxy::{Protocol, ProxyError, ProxyOutcome, Transform};
 
 #[derive(Deserialize)]
 pub(super) struct ProxyPath {
-    channel: Option<String>,
     path: String,
 }
 
 #[derive(Deserialize)]
 pub(super) struct EncodedPath {
-    channel: Option<String>,
     encoded: String,
 }
 
 #[derive(Deserialize)]
 pub(super) struct CargoCratePath {
-    channel: Option<String>,
     #[serde(rename = "crate")]
     name: String,
     version: String,
@@ -23,13 +20,9 @@ pub(super) struct CargoCratePath {
 
 pub(super) async fn go(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ProxyPath>,
-    headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     fetch(
         &state,
         context.channel,
@@ -42,30 +35,27 @@ pub(super) async fn go(
 
 pub(super) async fn python_simple(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ProxyPath>,
     headers: HeaderMap,
 ) -> Response {
-    fetch_python_simple(&state, path.channel.as_deref(), &path.path, &headers).await
+    fetch_python_simple(&state, &context, &path.path, &headers).await
 }
 
 pub(super) async fn python_simple_root(
     State(state): State<Arc<AppState>>,
-    Path(path): Path<ChannelPath>,
+    context: ChannelContext,
     headers: HeaderMap,
 ) -> Response {
-    fetch_python_simple(&state, path.channel.as_deref(), "", &headers).await
+    fetch_python_simple(&state, &context, "", &headers).await
 }
 
 async fn fetch_python_simple(
     state: &Arc<AppState>,
-    channel: Option<&str>,
+    context: &ChannelContext,
     path: &str,
     headers: &HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(state, channel, headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok());
@@ -77,13 +67,9 @@ async fn fetch_python_simple(
 
 pub(super) async fn python_file(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<EncodedPath>,
-    headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let (encoded, suffix) = [".metadata", ".asc"]
         .into_iter()
         .find_map(|suffix| {
@@ -92,47 +78,39 @@ pub(super) async fn python_file(
                 .map(|encoded| (encoded, suffix))
         })
         .unwrap_or((&path.encoded, ""));
-    match state
-        .proxy
-        .fetch_encoded_url_with_suffix(context.channel, Protocol::Python, encoded, suffix)
-        .await
-    {
-        Ok(outcome) => outcome_response(&state, context.channel, outcome).await,
-        Err(error) => proxy_failure(error),
-    }
+    fetch_encoded(&state, context.channel, Protocol::Python, encoded, suffix).await
 }
 
 pub(super) async fn npm(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ProxyPath>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
+    if let Some(encoded) = path.path.strip_prefix("-/tarball/") {
+        return fetch_encoded(&state, context.channel, Protocol::Npm, encoded, "").await;
+    }
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok());
-    fetch_npm(
+    let Some(transform) = Transform::npm_metadata(context.route_prefix(), accept) else {
+        return StatusCode::NOT_ACCEPTABLE.into_response();
+    };
+    fetch(
         &state,
         context.channel,
+        Protocol::Npm,
         &path.path,
-        context.route_prefix(),
-        accept,
+        transform,
     )
     .await
 }
 
 pub(super) async fn cargo_index(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ProxyPath>,
-    headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     fetch(
         &state,
         context.channel,
@@ -143,15 +121,7 @@ pub(super) async fn cargo_index(
     .await
 }
 
-pub(super) async fn cargo_config(
-    State(state): State<Arc<AppState>>,
-    Path(path): Path<ChannelPath>,
-    headers: HeaderMap,
-) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
+pub(super) async fn cargo_config(context: ChannelContext) -> Response {
     Json(serde_json::json!({
         "dl": format!("{}/proxy/cargo/crates", context.route_prefix()),
         "api": null,
@@ -162,30 +132,10 @@ pub(super) async fn cargo_config(
 
 pub(super) async fn cargo_crate(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<CargoCratePath>,
-    headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     fetch_cargo_crate(&state, context.channel, &path.name, &path.version).await
-}
-
-async fn fetch_npm(
-    state: &Arc<AppState>,
-    channel: ChannelId,
-    path: &str,
-    prefix: String,
-    accept: Option<&str>,
-) -> Response {
-    if let Some(encoded) = path.strip_prefix("-/tarball/") {
-        return fetch_encoded(state, channel, Protocol::Npm, encoded).await;
-    }
-    let Some(transform) = Transform::npm_metadata(prefix, accept) else {
-        return StatusCode::NOT_ACCEPTABLE.into_response();
-    };
-    fetch(state, channel, Protocol::Npm, path, transform).await
 }
 
 async fn fetch_cargo_crate(
@@ -219,10 +169,11 @@ async fn fetch_encoded(
     channel: ChannelId,
     protocol: Protocol,
     encoded: &str,
+    suffix: &str,
 ) -> Response {
     match state
         .proxy
-        .fetch_encoded_url(channel, protocol, encoded)
+        .fetch_encoded_url(channel, protocol, encoded, suffix)
         .await
     {
         Ok(outcome) => outcome_response(state, channel, outcome).await,
@@ -262,25 +213,23 @@ async fn outcome_response(
             status,
             body,
             content_type,
-        } => {
-            let mut builder = Response::builder().status(status);
-            if let Some(content_type) = content_type {
-                builder = builder.header(header::CONTENT_TYPE, content_type);
-            }
-            builder.body(Body::from(body)).unwrap()
-        }
+        } => upstream_response(status, content_type, Body::from(body)),
         ProxyOutcome::UpstreamStream {
             status,
             body,
             content_type,
-        } => {
-            let mut builder = Response::builder().status(status);
-            if let Some(content_type) = content_type {
-                builder = builder.header(header::CONTENT_TYPE, content_type);
-            }
-            builder.body(Body::from_stream(body)).unwrap()
-        }
+        } => upstream_response(status, content_type, Body::from_stream(body)),
     }
+}
+
+/// Passes an upstream response through unchanged apart from its content type, whether
+/// the body was buffered or is being streamed past the cache under disk pressure.
+fn upstream_response(status: StatusCode, content_type: Option<String>, body: Body) -> Response {
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder.body(body).unwrap()
 }
 
 fn proxy_failure(error: ProxyError) -> Response {

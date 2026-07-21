@@ -86,22 +86,22 @@ pub struct SpaceLedger {
 }
 
 impl SpaceLedger {
+    /// Starts degraded with no observation, then takes the first one through `refresh`
+    /// so a ledger whose very first `statvfs` fails stays degraded and admits nothing.
     pub fn new(source: Arc<dyn FreeSpace>, policy: SpacePolicy) -> Self {
-        let (free_observed, degraded) = match source.free_bytes() {
-            Some(free) => (free, false),
-            None => (0, true),
-        };
-        Self {
+        let ledger = Self {
             source,
             policy,
             state: Mutex::new(State {
-                free_observed,
+                free_observed: 0,
                 reserved: 0,
                 committed_since: 0,
-                degraded,
+                degraded: true,
                 reclaiming: false,
             }),
-        }
+        };
+        ledger.refresh();
+        ledger
     }
 
     /// Re-observes filesystem free space and resets the committed-since counter, since

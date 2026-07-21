@@ -17,7 +17,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{Stream, stream};
 use html_escape::decode_html_entities;
-use http::{HeaderMap, HeaderValue, StatusCode, header};
+use http::{HeaderValue, StatusCode, header};
 use lol_html::{RewriteStrSettings, element, rewrite_str};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -123,6 +123,54 @@ enum PythonRepresentation {
     Json,
 }
 
+/// Splits one `Accept` media range into its lowercased media type and its `q` value,
+/// defaulting to 1.0 and clamping to the range the grammar allows.
+fn media_range(range: &str) -> (String, f32) {
+    let mut fields = range.split(';');
+    let media_type = fields
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let quality = fields
+        .filter_map(|field| field.trim().split_once('='))
+        .find_map(|(name, value)| {
+            name.trim()
+                .eq_ignore_ascii_case("q")
+                .then(|| value.trim().parse::<f32>().ok())
+                .flatten()
+        })
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    (media_type, quality)
+}
+
+/// Records one media range against a candidate representation as `(specificity,
+/// quality)`, keeping the most specific range that named it — 2 for an exact media
+/// type, 1 for a subtype wildcard, 0 for `*/*` — and the best quality among equally
+/// specific ones.
+fn offer(candidate: &mut Option<(u8, f32)>, specificity: u8, quality: f32) {
+    if candidate.is_none_or(|(current_specificity, current_quality)| {
+        specificity > current_specificity
+            || (specificity == current_specificity && quality > current_quality)
+    }) {
+        *candidate = Some((specificity, quality));
+    }
+}
+
+/// Whether `preferred` beats `other`. Equal qualities go to `preferred` whenever it was
+/// named at least as specifically, so a wildcard range covering both — `application/*` —
+/// resolves to whichever representation the caller passes first. That choice is the
+/// protocol default and differs per protocol: Python serves JSON, npm serves abbreviated.
+fn outranks(preferred: (u8, f32), other: (u8, f32)) -> bool {
+    preferred.1 > other.1 || (preferred.1 == other.1 && preferred.0 > 0 && preferred.0 >= other.0)
+}
+
+/// Drops a candidate the client explicitly refused with `q=0`.
+fn acceptable(candidate: Option<(u8, f32)>) -> Option<(u8, f32)> {
+    candidate.filter(|(_, quality)| *quality > 0.0)
+}
+
 fn negotiate_python(accept: Option<&str>) -> Option<PythonRepresentation> {
     let Some(accept) = accept.filter(|value| !value.trim().is_empty()) else {
         return Some(PythonRepresentation::Html);
@@ -130,65 +178,33 @@ fn negotiate_python(accept: Option<&str>) -> Option<PythonRepresentation> {
     let mut html = None;
     let mut json = None;
     for range in accept.split(',') {
-        let mut fields = range.split(';');
-        let media_type = fields
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        let quality = fields
-            .filter_map(|field| field.trim().split_once('='))
-            .find_map(|(name, value)| {
-                name.trim()
-                    .eq_ignore_ascii_case("q")
-                    .then(|| value.trim().parse::<f32>().ok())
-                    .flatten()
-            })
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
-        let update = |candidate: &mut Option<(u8, f32)>, specificity| {
-            if candidate.is_none_or(|current| {
-                specificity > current.0 || (specificity == current.0 && quality > current.1)
-            }) {
-                *candidate = Some((specificity, quality));
-            }
-        };
+        let (media_type, quality) = media_range(range);
         match media_type.as_str() {
             "application/vnd.pypi.simple.v1+json" | "application/vnd.pypi.simple.latest+json" => {
-                update(&mut json, 2)
+                offer(&mut json, 2, quality);
             }
             "application/vnd.pypi.simple.v1+html"
             | "application/vnd.pypi.simple.latest+html"
-            | "text/html" => update(&mut html, 2),
+            | "text/html" => offer(&mut html, 2, quality),
             "application/*" => {
-                update(&mut html, 1);
-                update(&mut json, 1);
+                offer(&mut html, 1, quality);
+                offer(&mut json, 1, quality);
             }
-            "text/*" => update(&mut html, 1),
+            "text/*" => offer(&mut html, 1, quality),
             "*/*" => {
-                update(&mut html, 0);
-                update(&mut json, 0);
+                offer(&mut html, 0, quality);
+                offer(&mut json, 0, quality);
             }
             _ => {}
         }
     }
-    let html = html.filter(|(_, quality)| *quality > 0.0);
-    let json = json.filter(|(_, quality)| *quality > 0.0);
-    match (html, json) {
+    match (acceptable(html), acceptable(json)) {
         (None, None) => None,
         (Some(_), None) => Some(PythonRepresentation::Html),
         (None, Some(_)) => Some(PythonRepresentation::Json),
-        (Some((html_specificity, html_quality)), Some((json_specificity, json_quality))) => {
-            if json_quality > html_quality
-                || (json_quality == html_quality
-                    && json_specificity > 0
-                    && json_specificity >= html_specificity)
-            {
-                Some(PythonRepresentation::Json)
-            } else {
-                Some(PythonRepresentation::Html)
-            }
-        }
+        // JSON is Python's default, so it takes the ties `application/*` produces.
+        (Some(html), Some(json)) if outranks(json, html) => Some(PythonRepresentation::Json),
+        (Some(_), Some(_)) => Some(PythonRepresentation::Html),
     }
 }
 
@@ -199,53 +215,27 @@ fn negotiate_npm(accept: Option<&str>) -> Option<bool> {
     let mut abbreviated = None;
     let mut full = None;
     for range in accept.split(',') {
-        let mut fields = range.split(';');
-        let media_type = fields
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        let quality = fields
-            .filter_map(|field| field.trim().split_once('='))
-            .find_map(|(name, value)| {
-                name.trim()
-                    .eq_ignore_ascii_case("q")
-                    .then(|| value.trim().parse::<f32>().ok())
-                    .flatten()
-            })
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
-        let update = |candidate: &mut Option<(u8, f32)>, specificity| {
-            if candidate.is_none_or(|current| {
-                specificity > current.0 || (specificity == current.0 && quality > current.1)
-            }) {
-                *candidate = Some((specificity, quality));
-            }
-        };
+        let (media_type, quality) = media_range(range);
         match media_type.as_str() {
-            "application/vnd.npm.install-v1+json" => update(&mut abbreviated, 2),
-            "application/json" => update(&mut full, 2),
+            "application/vnd.npm.install-v1+json" => offer(&mut abbreviated, 2, quality),
+            "application/json" => offer(&mut full, 2, quality),
             "application/*" => {
-                update(&mut abbreviated, 1);
-                update(&mut full, 1);
+                offer(&mut abbreviated, 1, quality);
+                offer(&mut full, 1, quality);
             }
             "*/*" => {
-                update(&mut abbreviated, 0);
-                update(&mut full, 0);
+                offer(&mut abbreviated, 0, quality);
+                offer(&mut full, 0, quality);
             }
             _ => {}
         }
     }
-    let abbreviated = abbreviated.filter(|(_, quality)| *quality > 0.0);
-    let full = full.filter(|(_, quality)| *quality > 0.0);
-    match (abbreviated, full) {
+    match (acceptable(abbreviated), acceptable(full)) {
         (None, None) => None,
         (Some(_), None) => Some(true),
         (None, Some(_)) => Some(false),
-        (Some((specificity, quality)), Some((full_specificity, full_quality))) => Some(
-            quality > full_quality
-                || (quality == full_quality && specificity > 0 && specificity >= full_specificity),
-        ),
+        // Abbreviated is npm's default, so it takes the ties `application/*` produces.
+        (Some(abbreviated), Some(full)) => Some(outranks(abbreviated, full)),
     }
 }
 
@@ -388,7 +378,7 @@ impl ProxyService {
         }
     }
 
-    pub fn url(&self, protocol: Protocol, path: &str) -> Result<Url, ProxyError> {
+    fn url(&self, protocol: Protocol, path: &str) -> Result<Url, ProxyError> {
         let base = match protocol {
             Protocol::Go => &self.bases.go,
             Protocol::Python => &self.bases.python,
@@ -414,17 +404,9 @@ impl ProxyService {
         self.fetch_url(channel, protocol, url, transform).await
     }
 
+    /// Fetches a base64url-encoded upstream URL, optionally with `suffix` appended to
+    /// its path — how PyPI's `.metadata` and `.asc` sidecars are addressed.
     pub async fn fetch_encoded_url(
-        &self,
-        channel: ChannelId,
-        protocol: Protocol,
-        encoded: &str,
-    ) -> Result<ProxyOutcome, ProxyError> {
-        self.fetch_encoded_url_with_suffix(channel, protocol, encoded, "")
-            .await
-    }
-
-    pub async fn fetch_encoded_url_with_suffix(
         &self,
         channel: ChannelId,
         protocol: Protocol,
@@ -459,11 +441,10 @@ impl ProxyService {
         transform: Transform,
     ) -> Result<ProxyOutcome, ProxyError> {
         let reference = proxy_reference(protocol, &url, transform.cache_variant());
-        if let Some(record) = self.cache.resolve_reference(channel, &reference).await?
-            && self.clock.now().saturating_sub(record.updated_at) < self.ttl
-            && let Some(outcome) = self
-                .cached_outcome(channel, record.artifact, &url, &transform)
-                .await?
+        let cached = self.cache.resolve_reference(channel, &reference).await?;
+        if let Some(outcome) = self
+            .fresh_outcome(channel, cached.as_ref(), &url, &transform)
+            .await?
         {
             return Ok(outcome);
         }
@@ -480,12 +461,12 @@ impl ProxyService {
             key,
         };
         let _coalesced = lock.lock().await;
+        // Re-read behind the coalescing lock: whichever request held it may already have
+        // refreshed this reference.
         let current = self.cache.resolve_reference(channel, &reference).await?;
-        if let Some(record) = &current
-            && self.clock.now().saturating_sub(record.updated_at) < self.ttl
-            && let Some(outcome) = self
-                .cached_outcome(channel, record.artifact, &url, &transform)
-                .await?
+        if let Some(outcome) = self
+            .fresh_outcome(channel, current.as_ref(), &url, &transform)
+            .await?
         {
             return Ok(outcome);
         }
@@ -499,27 +480,9 @@ impl ProxyService {
             .send_validated(protocol, url.clone(), &current, transform.upstream_accept())
             .await?;
         if response.status() == StatusCode::NOT_MODIFIED {
-            let record = current.ok_or_else(|| {
-                ProxyError::Unavailable("upstream returned 304 without a cached value".to_owned())
-            })?;
-            self.cache
-                .bind_reference_with_validators(
-                    channel,
-                    reference,
-                    record.artifact,
-                    record.etag,
-                    record.last_modified,
-                    Durability::BestEffort,
-                )
-                .await?;
             return self
-                .cached_outcome(channel, record.artifact, &url, &transform)
-                .await?
-                .ok_or_else(|| {
-                    ProxyError::Unavailable(
-                        "upstream returned 304 for a missing cached body".to_owned(),
-                    )
-                });
+                .revalidated(channel, reference, current, &url, &transform)
+                .await;
         }
 
         let status = response.status();
@@ -544,7 +507,7 @@ impl ProxyService {
             // near-full steady state), the body is handed back untouched and streamed
             // straight to the client — no buffering and no second upstream fetch.
             Transform::None => {
-                let upstream_length = header_length(response.headers());
+                let upstream_length = crate::transport::content_length(response.headers());
                 let bypass_content_type = content_type.clone();
                 match self
                     .cache
@@ -604,6 +567,57 @@ impl ProxyService {
                 .await
             }
         }
+    }
+
+    /// The cached outcome when a stored binding is still inside the revalidation TTL and
+    /// its body is still on disk. `None` means the upstream has to be consulted.
+    async fn fresh_outcome(
+        &self,
+        channel: ChannelId,
+        record: Option<&ReferenceRecord>,
+        upstream: &Url,
+        transform: &Transform,
+    ) -> Result<Option<ProxyOutcome>, ProxyError> {
+        let Some(record) =
+            record.filter(|record| self.clock.now().saturating_sub(record.updated_at) < self.ttl)
+        else {
+            return Ok(None);
+        };
+        self.cached_outcome(channel, record.artifact, upstream, transform)
+            .await
+    }
+
+    /// Completes a revalidation: rebinds the reference so its TTL restarts, then serves
+    /// the cached body. A 304 with nothing cached, or whose body has since been
+    /// reclaimed, leaves nothing to answer with.
+    async fn revalidated(
+        &self,
+        channel: ChannelId,
+        reference: String,
+        current: Option<ReferenceRecord>,
+        upstream: &Url,
+        transform: &Transform,
+    ) -> Result<ProxyOutcome, ProxyError> {
+        let record = current.ok_or_else(|| {
+            ProxyError::Unavailable("upstream returned 304 without a cached value".to_owned())
+        })?;
+        self.cache
+            .bind_reference_with_validators(
+                channel,
+                reference,
+                record.artifact,
+                record.etag,
+                record.last_modified,
+                Durability::BestEffort,
+            )
+            .await?;
+        self.cached_outcome(channel, record.artifact, upstream, transform)
+            .await?
+            .ok_or_else(|| {
+                ProxyError::Unavailable(
+                    "upstream returned 304 for a missing cached body".to_owned(),
+                )
+            })
     }
 
     async fn cached_outcome(
@@ -876,20 +890,6 @@ fn is_redirect(status: StatusCode) -> bool {
             | StatusCode::TEMPORARY_REDIRECT
             | StatusCode::PERMANENT_REDIRECT
     )
-}
-
-/// Publishes proxied bytes best-effort, returning the cached artifact id — or `None`
-/// when the reservation failed under disk pressure so the caller can bypass the cache
-/// and serve the upstream response directly instead of surfacing an error.
-/// Parses an upstream `Content-Length` so the cache can size its reservation up front
-/// and make an immediate admit/bypass decision before the body is streamed.
-fn header_length(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get(header::CONTENT_LENGTH)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()
 }
 
 fn rewrite_npm(
