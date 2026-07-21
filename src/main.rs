@@ -56,6 +56,8 @@ where
 async fn serve(arguments: flywheel::cli::ServeArgs) -> anyhow::Result<()> {
     let startup = Instant::now();
     let listen = arguments.listen;
+    let data_dir = arguments.data_dir.clone();
+    let foreground_concurrency = arguments.foreground_concurrency;
     let flywheel = Arc::new(Flywheel::open(arguments.config()).await?);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let cancellation = CancellationToken::new();
@@ -68,8 +70,8 @@ async fn serve(arguments: flywheel::cli::ServeArgs) -> anyhow::Result<()> {
         component = "server",
         version = env!("CARGO_PKG_VERSION"),
         %listen,
-        data_dir = %arguments.data_dir.display(),
-        foreground_concurrency = arguments.foreground_concurrency,
+        data_dir = %data_dir.display(),
+        foreground_concurrency,
         startup_ms = startup.elapsed().as_millis() as u64,
         "Flywheel is ready"
     );

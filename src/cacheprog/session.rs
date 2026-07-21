@@ -282,9 +282,14 @@ async fn prefetch(
             // Every zero-size action shares the one empty output; synthesize the
             // file locally instead of downloading nothing over the network. A
             // zero-size entry under any other digest can never verify, so it is
-            // dropped from the work list entirely.
-            if entry.output == EMPTY_OUTPUT {
-                super::write_disk_file(directory, &entry.output, &[]).await?;
+            // dropped from the work list entirely. A failed write is one future
+            // foreground miss, like any other per-object failure, so it neither
+            // counts as local nor stops the pass.
+            if entry.output == EMPTY_OUTPUT
+                && super::write_disk_file(directory, &entry.output, &[])
+                    .await
+                    .is_ok()
+            {
                 local += 1;
             }
             continue;
