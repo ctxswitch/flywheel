@@ -242,9 +242,10 @@ fn negotiate_npm(accept: Option<&str>) -> Option<bool> {
         (None, None) => None,
         (Some(_), None) => Some(true),
         (None, Some(_)) => Some(false),
-        (Some((specificity, quality)), Some((_, full_quality))) => {
-            Some(quality > full_quality || (quality == full_quality && specificity > 0))
-        }
+        (Some((specificity, quality)), Some((full_specificity, full_quality))) => Some(
+            quality > full_quality
+                || (quality == full_quality && specificity > 0 && specificity >= full_specificity),
+        ),
     }
 }
 

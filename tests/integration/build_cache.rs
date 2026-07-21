@@ -522,16 +522,29 @@ async fn warm_build_costs_one_manifest_get_plus_one_get_per_distinct_output() {
         );
     }
 
-    // The complete warm-build request set: one manifest GET, no request for any
-    // zero-size action, one GET per distinct nonzero output, nothing repeated.
+    // The complete warm-build request set: the bootstrap manifest GET, no
+    // request for any zero-size action, one GET per distinct nonzero output,
+    // nothing repeated, and the close-time read-modify-write that carries the
+    // locally answered actions forward with a fresh `last_seen`.
     let warm = requests.lock().unwrap()[populate_requests..].to_vec();
-    assert_eq!(warm.len(), 4, "exactly the bootstrap traffic: {warm:?}");
+    assert_eq!(
+        warm.len(),
+        6,
+        "the bootstrap traffic plus the manifest write-back: {warm:?}"
+    );
     assert_eq!(
         warm.iter()
             .filter(|(method, path)| method == "GET" && path == &manifest_path)
             .count(),
+        2,
+        "one bootstrap read and one finalize read: {warm:?}"
+    );
+    assert_eq!(
+        warm.iter()
+            .filter(|(method, path)| method == "PUT" && path == &manifest_path)
+            .count(),
         1,
-        "warm requests: {warm:?}"
+        "a wholly local build still refreshes its manifest: {warm:?}"
     );
     for action in &zero_actions {
         let path = format!("/build-cache/http/go-{}", hex::encode(action));
