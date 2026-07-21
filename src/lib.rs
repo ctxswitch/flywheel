@@ -65,6 +65,7 @@ impl Flywheel {
             Arc::clone(&metadata),
             Arc::clone(&files),
             Arc::clone(&channel_gates),
+            Arc::clone(&clock),
         ));
         channels
             .ensure_default(config.default_expiry_seconds)

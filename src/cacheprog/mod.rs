@@ -222,29 +222,16 @@ where
             break;
         }
 
-        let event = if close_id.is_some() {
-            tokio::select! {
-                biased;
-                () = &mut shutdown => Event::Shutdown,
-                response = in_flight.next() => Event::Response(
-                    response.expect("in-flight request was checked")
-                ),
-            }
-        } else if in_flight.is_empty() {
-            tokio::select! {
-                biased;
-                () = &mut shutdown => Event::Shutdown,
-                message = reader.next_message() => Event::Input(message?),
-            }
-        } else {
-            tokio::select! {
-                biased;
-                () = &mut shutdown => Event::Shutdown,
-                message = reader.next_message() => Event::Input(message?),
-                response = in_flight.next() => {
-                    Event::Response(response.expect("in-flight request was checked"))
-                },
-            }
+        // Shutdown first, then input, then completions: a `close` stops the helper
+        // reading further requests, and an empty `FuturesUnordered` would otherwise
+        // report completion immediately and spin.
+        let event = tokio::select! {
+            biased;
+            () = &mut shutdown => Event::Shutdown,
+            message = reader.next_message(), if close_id.is_none() => Event::Input(message?),
+            response = in_flight.next(), if !in_flight.is_empty() => {
+                Event::Response(response.expect("in-flight request was checked"))
+            },
         };
 
         match event {
@@ -556,8 +543,15 @@ async fn write_atomic(path: &Path, body: &[u8]) -> anyhow::Result<()> {
         return Err(error.into());
     }
     drop(file);
-    if let Err(error) = tokio::fs::rename(&temporary, path).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
+    publish_temporary(&temporary, path).await
+}
+
+/// Moves a fully written temporary file into its final place. Losing the rename to a
+/// concurrent writer of the same content-addressed object is not a failure: the
+/// temporary is dropped and the file that won stands.
+async fn publish_temporary(temporary: &Path, path: &Path) -> anyhow::Result<()> {
+    if let Err(error) = tokio::fs::rename(temporary, path).await {
+        let _ = tokio::fs::remove_file(temporary).await;
         if !tokio::fs::try_exists(path).await? {
             return Err(error.into());
         }

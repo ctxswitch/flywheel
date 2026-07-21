@@ -414,12 +414,7 @@ async fn download_object(
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error);
     }
-    if let Err(error) = tokio::fs::rename(&temporary, &path).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        if !tokio::fs::try_exists(&path).await? {
-            return Err(error.into());
-        }
-    }
+    super::publish_temporary(&temporary, &path).await?;
     Ok(Some(entry.size))
 }
 

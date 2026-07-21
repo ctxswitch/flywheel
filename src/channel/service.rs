@@ -1,13 +1,13 @@
 use super::{Access, ChannelId, ChannelRecord, ChannelToken, Lifecycle};
-use crate::storage::{
-    local::{ArtifactFiles, LocalError},
-    metadata::{MetadataError, RocksMetadata},
+use crate::{
+    clock::Clock,
+    storage::{
+        local::{ArtifactFiles, LocalError},
+        metadata::{MetadataError, RocksMetadata},
+    },
 };
 use dashmap::DashMap;
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 /// The per-channel lifecycle gates, shared between the channel service (which takes the
@@ -42,6 +42,7 @@ pub struct ChannelService {
     store: Arc<RocksMetadata>,
     files: Arc<ArtifactFiles>,
     gates: Arc<ChannelGates>,
+    clock: Arc<dyn Clock>,
 }
 
 pub struct IssuedChannel {
@@ -59,11 +60,13 @@ impl ChannelService {
         store: Arc<RocksMetadata>,
         files: Arc<ArtifactFiles>,
         gates: Arc<ChannelGates>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             store,
             files,
             gates,
+            clock,
         }
     }
 
@@ -76,7 +79,7 @@ impl ChannelService {
                     access: Access::Open,
                     expiry_seconds,
                     state: Lifecycle::Active,
-                    created_at: unix_time(),
+                    created_at: self.clock.now(),
                 };
                 match self.store.create_channel(record.clone()).await {
                     Ok(()) => record,
@@ -109,7 +112,7 @@ impl ChannelService {
                 .map_or(Access::Open, |token| Access::Token(token.digest())),
             expiry_seconds,
             state: Lifecycle::Active,
-            created_at: unix_time(),
+            created_at: self.clock.now(),
         };
         self.store.create_channel(record.clone()).await?;
         self.gates.gate(record.id);
@@ -121,23 +124,16 @@ impl ChannelService {
         id: ChannelId,
         credential: Option<&str>,
     ) -> Result<ChannelLease, ChannelError> {
-        let Some(record) = self.store.channel(id).await? else {
-            return Err(ChannelError::NotFound);
-        };
-        authorize_record(&record, credential)?;
-        if record.state != Lifecycle::Active {
-            return Err(ChannelError::Deleting);
-        }
+        // The pre-gate check is load-bearing, not a fast path: `ChannelGates::gate`
+        // inserts an entry for whatever id it is handed, so taking the gate before the
+        // channel is known to exist would leave a permanent `DashMap` entry behind for
+        // every unknown id a client asks about.
+        self.authorize(id, credential).await?;
         let guard = self.gates.gate(id).read_owned().await;
-        let Some(current) = self.store.channel(id).await? else {
-            return Err(ChannelError::NotFound);
-        };
-        authorize_record(&current, credential)?;
-        if current.state != Lifecycle::Active {
-            return Err(ChannelError::Deleting);
-        }
+        // Recheck under the gate: a deletion may have landed between the two.
+        let record = self.authorize(id, credential).await?;
         Ok(ChannelLease {
-            record: current,
+            record,
             _guard: guard,
         })
     }
@@ -216,13 +212,6 @@ fn authorize_record(record: &ChannelRecord, credential: Option<&str>) -> Result<
         Access::Token(_) => return Err(ChannelError::Unauthorized),
     }
     Ok(())
-}
-
-fn unix_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[derive(Debug, thiserror::Error)]
