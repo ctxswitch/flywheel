@@ -14,7 +14,7 @@ fn artifact_identity_accepts_only_canonical_sha256() {
     let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let id = ArtifactId::parse("sha256", hex).expect("valid identity");
 
-    assert_eq!(id.algorithm(), "sha256");
+    assert_eq!(id.to_string(), format!("sha256:{hex}"));
     assert_eq!(id.digest().to_string(), hex);
     assert!(ArtifactId::parse("sha512", hex).is_err());
     assert!(ArtifactId::parse("sha256", &hex.to_uppercase()).is_err());
