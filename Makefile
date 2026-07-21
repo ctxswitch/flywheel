@@ -1,5 +1,4 @@
 CARGO ?= cargo
-CARGO_FEATURES ?= --all-features
 INSTALL ?= install
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
@@ -21,18 +20,18 @@ endif
 
 .PHONY: build release install check fmt fmt-check lint test ci clean help
 
-build: ## Build Flywheel with every feature enabled.
-	$(CARGO) build $(CARGO_FEATURES)
+build: ## Build the development binary.
+	$(CARGO) build
 
 release: ## Build the optimized production binary from the locked dependency graph.
-	$(CARGO) build --release --locked $(CARGO_FEATURES)
+	$(CARGO) build --release --locked
 
 install: release ## Install the production binary (PREFIX=/usr/local by default).
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
 	$(INSTALL) -m 0755 "$(RELEASE_BINARY)" "$(DESTDIR)$(BINDIR)/flywheel"
 
 check: ## Type-check all targets without producing binaries.
-	$(CARGO) check --all-targets $(CARGO_FEATURES)
+	$(CARGO) check --all-targets
 
 fmt: ## Format Rust sources.
 	$(CARGO) fmt --all
@@ -41,10 +40,10 @@ fmt-check: ## Verify Rust formatting without changing files.
 	$(CARGO) fmt --all -- --check
 
 lint: ## Run Clippy and reject every warning.
-	$(CARGO) clippy --all-targets $(CARGO_FEATURES) -- -D warnings
+	$(CARGO) clippy --all-targets -- -D warnings
 
 test: ## Run the hermetic test suite.
-	$(CARGO) test $(CARGO_FEATURES)
+	$(CARGO) test
 
 ci: fmt-check lint test ## Run every CI quality gate.
 

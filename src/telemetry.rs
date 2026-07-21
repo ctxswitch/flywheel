@@ -371,6 +371,14 @@ impl<R: PrefetchRecorder> PrefetchObservation<R> {
     fn add_bytes(&mut self, bytes: usize) {
         self.bytes = self.bytes.saturating_add(bytes as u64);
     }
+
+    /// Marks the transfer as having reached the end of the body. `Drop` reads this to
+    /// tell a completed transfer from a cancelled one, so it is written through a
+    /// method: assigning the field directly in the stream's final arm reads as a dead
+    /// store to a newer rustc, which `-D warnings` then rejects.
+    fn complete(&mut self) {
+        self.completed = true;
+    }
 }
 
 impl<R: PrefetchRecorder> Drop for PrefetchObservation<R> {
@@ -414,7 +422,7 @@ where
                 }
                 Some(Err(error)) => Some((Err(error), (stream, observation))),
                 None => {
-                    observation.completed = true;
+                    observation.complete();
                     None
                 }
             }
