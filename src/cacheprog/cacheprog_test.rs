@@ -1,7 +1,7 @@
 use super::{Request, Response, read_protocol_line, run_with_io, run_with_shutdown, session};
 use crate::{
     cli::CacheprogArgs,
-    manifest::{MANIFEST_VERSION, Manifest, ManifestEntry, manifest_key},
+    manifest::{MANIFEST_MAX_AGE_SECONDS, MANIFEST_VERSION, Manifest, ManifestEntry, manifest_key},
 };
 use axum::{
     Json, Router,
@@ -383,6 +383,65 @@ async fn manifest_known_gets_answer_locally_without_any_request() {
     assert_eq!(hex::encode(&response.output_id), output);
     assert_eq!(response.size, body.len() as u64);
     assert!(std::path::Path::new(&response.disk_path).is_file());
+}
+
+/// A get answered out of the local object directory is still usage. The merged
+/// manifest has to carry it forward with a fresh `last_seen`, or the actions
+/// prefetch predicts perfectly are exactly the ones that age out and get
+/// evicted first — the manifest would decay to only what it mispredicted.
+#[tokio::test]
+async fn locally_answered_gets_refresh_their_manifest_entry() {
+    // Unreachable on purpose: a local answer must never touch the network.
+    let base = reqwest::Url::parse("http://127.0.0.1:9/build-cache/http/").unwrap();
+    let client = reqwest::Client::new();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let body = b"perfectly predicted object";
+    let output = hex::encode(sha2::Sha256::digest(body));
+    tokio::fs::write(cache_dir.path().join(&output), body)
+        .await
+        .unwrap();
+    let action = hex::encode([9u8; 32]);
+    let stored = Manifest {
+        version: MANIFEST_VERSION,
+        entries: HashMap::from([(
+            action.clone(),
+            ManifestEntry {
+                output: output.clone(),
+                size: body.len() as u64,
+                last_seen: 100,
+            },
+        )]),
+    };
+    let session = session::SessionState::default();
+    session.manifest.set(stored.clone()).unwrap();
+
+    let response = super::get(
+        &client,
+        &base,
+        None,
+        cache_dir.path(),
+        &session,
+        Request {
+            id: 3,
+            command: "get".into(),
+            action_id: hex::decode(&action).unwrap(),
+            output_id: Vec::new(),
+            body_size: 0,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!response.miss);
+
+    // Finalize past the retention window: only a recorded use keeps the entry.
+    let now = 100 + MANIFEST_MAX_AGE_SECONDS + 1;
+    let used = session.used.lock().unwrap().clone();
+    let merged = session::merge_manifest(Some(stored), &used, now);
+    assert_eq!(
+        merged.entries.get(&action).map(|entry| entry.last_seen),
+        Some(now),
+        "a locally answered get must refresh its manifest entry"
+    );
 }
 
 #[tokio::test]

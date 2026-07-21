@@ -568,6 +568,125 @@ async fn npm_negotiates_and_separately_caches_install_and_full_metadata() {
     server.abort();
 }
 
+/// A wildcard range never outranks a representation the client named explicitly
+/// at the same quality: `application/json, application/*` asks for the full
+/// document and merely tolerates the rest, so it must not be answered with the
+/// abbreviated one. Only an explicit q-value reorders the two.
+#[tokio::test]
+async fn wildcard_accept_ranges_never_outrank_a_named_representation() {
+    const NPM_INSTALL: &str = "application/vnd.npm.install-v1+json";
+    const NPM_FULL: &str = "application/json";
+    const PYTHON_JSON: &str = "application/vnd.pypi.simple.v1+json";
+    const PYTHON_HTML: &str = "application/vnd.pypi.simple.v1+html";
+
+    let upstream = Router::new()
+        .route(
+            "/npm/demo",
+            get(|headers: HeaderMap| async move {
+                match headers
+                    .get(header::ACCEPT)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some(NPM_INSTALL) => (
+                        [(header::CONTENT_TYPE, NPM_INSTALL)],
+                        json!({"name": "demo", "dist-tags": {"latest": "1.0.0"}}).to_string(),
+                    )
+                        .into_response(),
+                    Some(NPM_FULL) => (
+                        [(header::CONTENT_TYPE, NPM_FULL)],
+                        json!({"name": "demo", "readme": "full metadata"}).to_string(),
+                    )
+                        .into_response(),
+                    _ => StatusCode::NOT_ACCEPTABLE.into_response(),
+                }
+            }),
+        )
+        .route(
+            "/python/demo/",
+            get(|headers: HeaderMap| async move {
+                match headers
+                    .get(header::ACCEPT)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some(PYTHON_JSON) => (
+                        [(header::CONTENT_TYPE, PYTHON_JSON)],
+                        json!({"meta":{"api-version":"1.0"},"name":"demo","files":[]}).to_string(),
+                    )
+                        .into_response(),
+                    Some(PYTHON_HTML) => (
+                        [(header::CONTENT_TYPE, PYTHON_HTML)],
+                        "<!doctype html><html><body></body></html>",
+                    )
+                        .into_response(),
+                    _ => StatusCode::NOT_ACCEPTABLE.into_response(),
+                }
+            }),
+        );
+    let (base, server) = serve(upstream).await;
+    let directory = TempDir::new().unwrap();
+    let mut config = Config::new(directory.path());
+    config.npm_upstream = format!("{base}/npm/");
+    config.python_upstream = format!("{base}/python/");
+    let app = Flywheel::open(config).await.unwrap().router();
+
+    for (accept, expected) in [
+        ("application/json, application/*", NPM_FULL),
+        ("application/*, application/json", NPM_FULL),
+        ("application/json, */*", NPM_FULL),
+        (
+            "application/vnd.npm.install-v1+json, application/*",
+            NPM_INSTALL,
+        ),
+        (
+            "application/*, application/vnd.npm.install-v1+json",
+            NPM_INSTALL,
+        ),
+        // A bare wildcard names neither document, so npm's own abbreviated
+        // install metadata stays the answer.
+        ("application/*", NPM_INSTALL),
+        // Specificity only breaks ties: an explicit q-value still decides.
+        ("application/json;q=0.2, application/*", NPM_INSTALL),
+    ] {
+        let response = call_accepting(app.clone(), "/proxy/npm/demo", accept).await;
+        assert_eq!(response.status(), StatusCode::OK, "Accept: {accept}");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            expected,
+            "Accept: {accept}"
+        );
+    }
+
+    for (accept, expected) in [
+        (
+            "application/vnd.pypi.simple.v1+json, application/*",
+            PYTHON_JSON,
+        ),
+        (
+            "application/*, application/vnd.pypi.simple.v1+json",
+            PYTHON_JSON,
+        ),
+        (
+            "application/vnd.pypi.simple.v1+html, application/*",
+            PYTHON_HTML,
+        ),
+        ("text/html, */*", PYTHON_HTML),
+        (
+            "application/vnd.pypi.simple.v1+json;q=0.2, text/*",
+            PYTHON_HTML,
+        ),
+    ] {
+        let response = call_accepting(app.clone(), "/proxy/python/simple/demo/", accept).await;
+        assert_eq!(response.status(), StatusCode::OK, "Accept: {accept}");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            expected,
+            "Accept: {accept}"
+        );
+    }
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn protected_cargo_registry_accepts_credential_provider_authorization() {
     let directory = TempDir::new().unwrap();

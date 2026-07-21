@@ -187,7 +187,9 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if self.outstanding == 0 {
+        // A zero-length body reserves nothing yet still stages a file, so the
+        // shortcut has to clear the filesystem state as well as the accounting.
+        if self.outstanding == 0 && !matches!(self.state, ReservationState::Temporary(_)) {
             return;
         }
         let state = std::mem::replace(&mut self.state, ReservationState::Vacant);

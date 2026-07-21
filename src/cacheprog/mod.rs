@@ -441,6 +441,10 @@ async fn get(
         }
         if file_has_size(&path, entry.size).await {
             touch(&path);
+            // A local answer is still a use: without this the manifest retains the
+            // entry against its stale `last_seen`, so the best-predicted actions
+            // are the first to age out and the first evicted at the entry cap.
+            session.record_used(action, entry.output.clone(), entry.size);
             return Ok(Response {
                 id: request.id,
                 output_id: hex::decode(&entry.output)?,
