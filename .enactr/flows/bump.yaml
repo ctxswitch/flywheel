@@ -1,0 +1,71 @@
+name: bump-version
+
+on:
+  workflow_dispatch: {}
+
+concurrency: 1
+
+agents:
+  queue: default
+
+actions:
+  - input: Version bump
+    prompt: Choose the semantic version component to increment.
+    fields:
+      - select: Bump
+        key: bump
+        required: true
+        options:
+          - label: Patch
+            value: patch
+          - label: Minor
+            value: minor
+          - label: Major
+            value: major
+
+  - label: Bump version
+    key: bump
+    image: rust:1.94-bookworm
+    timeout: 20m
+    git:
+      ref: enactr/release-bump
+      create: true
+      create_from: main
+      fetch_depth: 0
+      clean: true
+      commit:
+        message: "chore(release): bump version"
+        author_name: github-actions[bot]
+        author_email: github-actions[bot]@users.noreply.github.com
+        paths:
+          - Cargo.toml
+          - Cargo.lock
+          - charts/flywheel/Chart.yaml
+      push:
+        atomic: true
+        pull_request:
+          base: main
+          title: "chore(release): bump version"
+          body: "Prepare the next Flywheel release. CI will run on this pull request before it can merge to protected main."
+    command: |
+      set -eu
+
+      current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+      IFS=. read -r major minor patch <<EOF
+      $current
+      EOF
+
+      case "$ENACTR_INPUT_BUMP" in
+        major) major=$((major + 1)); minor=0; patch=0 ;;
+        minor) minor=$((minor + 1)); patch=0 ;;
+        patch) patch=$((patch + 1)) ;;
+        *) echo "Unsupported version bump: $ENACTR_INPUT_BUMP" >&2; exit 1 ;;
+      esac
+
+      new="${major}.${minor}.${patch}"
+      echo "Bumping $current -> $new"
+
+      sed -i "0,/^version = \".*\"/s//version = \"$new\"/" Cargo.toml
+      cargo update --workspace
+      sed -i "s/^version:.*/version: $new/" charts/flywheel/Chart.yaml
+      sed -i "s/^appVersion:.*/appVersion: \"$new\"/" charts/flywheel/Chart.yaml
