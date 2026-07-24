@@ -1,0 +1,217 @@
+name: release
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - charts/flywheel/Chart.yaml
+
+concurrency: 1
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE_REPOSITORY: docker.io/ctxsh/flywheel
+
+agents:
+  queue: default
+
+actions:
+  - label: Resolve release tag
+    key: resolve-tag
+    image: alpine:3.22
+    command: |
+      set -eu
+
+      version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+      tag="v${version}"
+      enactr metadata set tag "$tag"
+      echo "Resolved release tag: $tag"
+
+  - label: Release checks
+    key: release-checks
+    image: rust:1.94-bookworm
+    timeout: 60m
+    command: |
+      set -eu
+
+      apt-get update
+      apt-get install --yes --no-install-recommends libclang-dev
+      rm -rf /var/lib/apt/lists/*
+      rustup component add rustfmt clippy
+      cargo fmt --check
+      cargo clippy --all-targets --all-features -- -D warnings
+      cargo test --all-targets
+
+  - group: Native image builds
+    actions:
+      - label: Build linux/amd64 image
+        key: image-amd64
+        image: quay.io/buildah/stable:v1.43
+        agents:
+          queue: build-amd64
+        timeout: 90m
+        env:
+          STORAGE_DRIVER: vfs
+          BUILDAH_ISOLATION: chroot
+        secrets:
+          DOCKERHUB_USERNAME: enactr://DOCKERHUB_USERNAME
+          DOCKERHUB_TOKEN: enactr://DOCKERHUB_TOKEN
+        command: |
+          set -eu
+
+          test "$(uname -m)" = "x86_64"
+          tag=$(enactr metadata get tag)
+          destination="${IMAGE_REPOSITORY}:${tag}-amd64"
+
+          printf '%s' "$DOCKERHUB_TOKEN" |
+            buildah login --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
+          buildah bud \
+            --arch amd64 \
+            --format docker \
+            --isolation chroot \
+            --tag "$destination" \
+            .
+          buildah push "$destination" "docker://$destination"
+
+      - label: Build linux/arm64 image
+        key: image-arm64
+        image: quay.io/buildah/stable:v1.43
+        agents:
+          queue: build-arm64
+        timeout: 90m
+        env:
+          STORAGE_DRIVER: vfs
+          BUILDAH_ISOLATION: chroot
+        secrets:
+          DOCKERHUB_USERNAME: enactr://DOCKERHUB_USERNAME
+          DOCKERHUB_TOKEN: enactr://DOCKERHUB_TOKEN
+        command: |
+          set -eu
+
+          test "$(uname -m)" = "aarch64"
+          tag=$(enactr metadata get tag)
+          destination="${IMAGE_REPOSITORY}:${tag}-arm64"
+
+          printf '%s' "$DOCKERHUB_TOKEN" |
+            buildah login --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
+          buildah bud \
+            --arch arm64 \
+            --format docker \
+            --isolation chroot \
+            --tag "$destination" \
+            .
+          buildah push "$destination" "docker://$destination"
+
+  - label: Publish multi-architecture manifests
+    key: image-manifest
+    image: quay.io/buildah/stable:v1.43
+    depends_on: [image-amd64, image-arm64]
+    timeout: 20m
+    env:
+      STORAGE_DRIVER: vfs
+    secrets:
+      DOCKERHUB_USERNAME: enactr://DOCKERHUB_USERNAME
+      DOCKERHUB_TOKEN: enactr://DOCKERHUB_TOKEN
+    command: |
+      set -eu
+
+      tag=$(enactr metadata get tag)
+      manifest="flywheel-${ENACTR_RUN_ID}"
+
+      printf '%s' "$DOCKERHUB_TOKEN" |
+        buildah login --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
+      buildah manifest create "$manifest"
+      buildah manifest add \
+        --arch amd64 \
+        "$manifest" \
+        "docker://${IMAGE_REPOSITORY}:${tag}-amd64"
+      buildah manifest add \
+        --arch arm64 \
+        "$manifest" \
+        "docker://${IMAGE_REPOSITORY}:${tag}-arm64"
+      buildah manifest push --all "$manifest" "docker://${IMAGE_REPOSITORY}:${tag}"
+      buildah manifest push --all "$manifest" "docker://${IMAGE_REPOSITORY}:latest"
+
+  - label: Publish Helm chart
+    key: helm
+    image: alpine/helm:3.20.2
+    depends_on: [image-manifest]
+    timeout: 20m
+    git:
+      ref: gh-pages
+      fetch_depth: 0
+      clean: true
+      commit:
+        message: "chore(release): publish chart"
+        author_name: github-actions[bot]
+        author_email: github-actions[bot]@users.noreply.github.com
+      push:
+        atomic: true
+    command: |
+      set -eu
+
+      source_dir=$(mktemp -d)
+      trap 'rm -rf "$source_dir"' EXIT
+      wget -qO- \
+        "https://github.com/ctxswitch/flywheel/archive/${ENACTR_COMMIT}.tar.gz" |
+        tar -xz --strip-components=1 -C "$source_dir"
+
+      helm lint "$source_dir/charts/flywheel" --strict
+      helm package "$source_dir/charts/flywheel" --destination "$source_dir"
+
+      cp "$source_dir"/*.tgz .
+      touch .nojekyll
+      if [ -f index.yaml ]; then
+        helm repo index . \
+          --url https://ctxswitch.github.io/flywheel \
+          --merge index.yaml
+      else
+        helm repo index . --url https://ctxswitch.github.io/flywheel
+      fi
+
+  - label: Publish GitHub release
+    key: github-release
+    image: alpine:3.22
+    depends_on: [image-manifest, helm]
+    timeout: 20m
+    secrets:
+      GH_TOKEN: enactr://GH_TOKEN
+    command: |
+      set -eu
+
+      apk add --no-cache github-cli
+      tag=$(enactr metadata get tag)
+      chart_version=$(sed -n 's/^version: *//p' charts/flywheel/Chart.yaml | head -1)
+
+      if gh release view "$tag" --repo ctxswitch/flywheel >/dev/null 2>&1; then
+        echo "GitHub release $tag already exists."
+      else
+        notes=$(cat <<EOF
+      ## Docker Image
+
+      \`\`\`text
+      docker pull ctxsh/flywheel:${tag}
+      \`\`\`
+
+      ## Helm Chart
+
+      \`\`\`text
+      helm repo add flywheel https://ctxswitch.github.io/flywheel
+      helm repo update
+      helm upgrade --install flywheel flywheel/flywheel \\
+        --version ${chart_version} \\
+        --namespace cache \\
+        --create-namespace
+      \`\`\`
+      EOF
+      )
+        gh release create "$tag" \
+          --repo ctxswitch/flywheel \
+          --target "$ENACTR_COMMIT" \
+          --title "$tag" \
+          --generate-notes \
+          --notes "$notes"
+      fi
