@@ -52,9 +52,9 @@ or abandoned release state.
 
 The Enactr `release` flow is manual-only while the GitHub and Enactr
 implementations coexist. Before doing any release work, it verifies that an
-existing tag points to the run commit and exits without publication when the
-GitHub release already exists. The push trigger should be enabled only in the
-cutover that disables the GitHub release publisher.
+existing tag points to the run commit and fails closed when the GitHub release
+already exists. The push trigger should be enabled only in the cutover that
+disables the GitHub release publisher.
 
 The release publishes the Helm index from a native `gh-pages` worktree; the
 action packages the exact run commit from a GitHub source archive so the

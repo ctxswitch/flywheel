@@ -13,7 +13,7 @@ agents:
   queue: default
 
 actions:
-  - label: Resolve release tag
+  - label: Preflight release
     key: resolve-tag
     image: alpine:3.22
     secrets:
@@ -38,12 +38,10 @@ actions:
       fi
 
       if gh release view "$tag" --repo ctxswitch/flywheel >/dev/null 2>&1; then
-        enactr metadata set release_required false
-        echo "GitHub release $tag already exists; publication is a no-op."
-      else
-        enactr metadata set release_required true
+        echo "GitHub release $tag already exists; refusing to republish it." >&2
+        exit 1
       fi
-      echo "Resolved release tag: $tag"
+      echo "Release $tag is clear to publish from $ENACTR_COMMIT."
 
   - label: Release checks
     key: release-checks
@@ -51,11 +49,6 @@ actions:
     timeout: 60m
     command: |
       set -eu
-
-      if [ "$(enactr metadata get release_required)" != "true" ]; then
-        echo "Release already exists; skipping release checks."
-        exit 0
-      fi
 
       apt-get update
       apt-get install --yes --no-install-recommends libclang-dev
@@ -81,11 +74,6 @@ actions:
           DOCKERHUB_TOKEN: enactr://DOCKERHUB_TOKEN
         command: |
           set -eu
-
-          if [ "$(enactr metadata get release_required)" != "true" ]; then
-            echo "Release already exists; skipping linux/amd64 image."
-            exit 0
-          fi
 
           test "$(uname -m)" = "x86_64"
           tag=$(enactr metadata get tag)
@@ -116,11 +104,6 @@ actions:
         command: |
           set -eu
 
-          if [ "$(enactr metadata get release_required)" != "true" ]; then
-            echo "Release already exists; skipping linux/arm64 image."
-            exit 0
-          fi
-
           test "$(uname -m)" = "aarch64"
           tag=$(enactr metadata get tag)
           destination="${IMAGE_REPOSITORY}:${tag}-arm64"
@@ -147,11 +130,6 @@ actions:
       DOCKERHUB_TOKEN: enactr://DOCKERHUB_TOKEN
     command: |
       set -eu
-
-      if [ "$(enactr metadata get release_required)" != "true" ]; then
-        echo "Release already exists; skipping image manifests."
-        exit 0
-      fi
 
       tag=$(enactr metadata get tag)
       manifest="flywheel-${ENACTR_RUN_ID}"
@@ -188,11 +166,6 @@ actions:
     command: |
       set -eu
 
-      if [ "$(enactr metadata get release_required)" != "true" ]; then
-        echo "Release already exists; skipping Helm publication."
-        exit 0
-      fi
-
       source_dir=$(mktemp -d)
       trap 'rm -rf "$source_dir"' EXIT
       wget -qO- \
@@ -222,19 +195,11 @@ actions:
     command: |
       set -eu
 
-      if [ "$(enactr metadata get release_required)" != "true" ]; then
-        echo "Release already exists; skipping GitHub release."
-        exit 0
-      fi
-
       apk add --no-cache github-cli
       tag=$(enactr metadata get tag)
       chart_version=$(sed -n 's/^version: *//p' charts/flywheel/Chart.yaml | head -1)
 
-      if gh release view "$tag" --repo ctxswitch/flywheel >/dev/null 2>&1; then
-        echo "GitHub release $tag already exists."
-      else
-        notes=$(cat <<EOF
+      notes=$(cat <<EOF
       ## Docker Image
 
       \`\`\`text
@@ -253,10 +218,9 @@ actions:
       \`\`\`
       EOF
       )
-        gh release create "$tag" \
-          --repo ctxswitch/flywheel \
-          --target "$ENACTR_COMMIT" \
-          --title "$tag" \
-          --generate-notes \
-          --notes "$notes"
-      fi
+      gh release create "$tag" \
+        --repo ctxswitch/flywheel \
+        --target "$ENACTR_COMMIT" \
+        --title "$tag" \
+        --generate-notes \
+        --notes "$notes"
