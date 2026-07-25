@@ -23,6 +23,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       release: ${{ steps.tag.outputs.release }}
+      source_ref: ${{ steps.tag.outputs.source_ref }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,13 +41,11 @@ jobs:
               echo "release=false" >> "$GITHUB_OUTPUT"
             else
               echo "release=true" >> "$GITHUB_OUTPUT"
+              echo "source_ref=$tag" >> "$GITHUB_OUTPUT"
             fi
           else
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git tag "$tag"
-            git push origin "$tag"
             echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "source_ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
           fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -60,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve-tag.outputs.tag }}
+          ref: ${{ needs.resolve-tag.outputs.source_ref }}
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libclang-dev
       - uses: dtolnay/rust-toolchain@stable
@@ -79,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve-tag.outputs.tag }}
+          ref: ${{ needs.resolve-tag.outputs.source_ref }}
 
       - uses: docker/login-action@v3
         with:
@@ -108,7 +107,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve-tag.outputs.tag }}
+          ref: ${{ needs.resolve-tag.outputs.source_ref }}
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -154,7 +153,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve-tag.outputs.tag }}
+          ref: ${{ needs.resolve-tag.outputs.source_ref }}
           fetch-depth: 0
 
       - name: Read chart version
@@ -166,11 +165,13 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
-          prev_tag=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
+          tag='${{ needs.resolve-tag.outputs.tag }}'
+          source_ref='${{ needs.resolve-tag.outputs.source_ref }}'
+          prev_tag=$(git tag --sort=-v:refname | grep '^v' | grep -Fvx "$tag" | sed -n '1p')
           if [ -z "$prev_tag" ]; then
-            log=$(git log --pretty=format:"- %s (%h)" '${{ needs.resolve-tag.outputs.tag }}')
+            log=$(git log --pretty=format:"- %s (%h)" "$source_ref")
           else
-            log=$(git log --pretty=format:"- %s (%h)" "${prev_tag}..${{ needs.resolve-tag.outputs.tag }}")
+            log=$(git log --pretty=format:"- %s (%h)" "${prev_tag}..${source_ref}")
           fi
 
           {
@@ -183,6 +184,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.resolve-tag.outputs.tag }}
+          target_commitish: ${{ needs.resolve-tag.outputs.source_ref }}
           generate_release_notes: false
           body: |
             ## Docker Image

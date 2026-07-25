@@ -20,7 +20,6 @@ Only actions that need branch behavior or publication declare `git`:
 
 | Action | Worktree | After a successful command |
 | --- | --- | --- |
-| `bump-version` | Reusable `enactr/release-bump` branch | Commit version files, push, and reconcile one PR to `main` |
 | Release `helm` | `gh-pages` branch | Commit the chart archive and index, then push |
 
 The Helm action can own only its `gh-pages` worktree, so it downloads the source
@@ -46,12 +45,20 @@ concurrently on the hosted `build-amd64` and `build-arm64` queues. Each build
 pushes an architecture tag; the dependent manifest action combines those
 images into the version tag and `latest`.
 
-The `bump-version` flow checks out the reusable `enactr/release-bump` branch,
-commits the selected version increment with Enactr's native Git module, pushes
-it, and reconciles one pull request to protected `main`. Merging that pull
-request triggers the `release` flow. The release publishes the Helm index from
-a native `gh-pages` worktree; the action packages the exact run commit from a
-GitHub source archive so the worktree remains single-purpose.
+Version bumps remain owned by `.github/workflows/bump.yaml`. Native Git
+configuration is literal, so an Enactr bump flow cannot yet create a fresh
+version-named branch safely; reusing a branch can start a later bump from stale
+or abandoned release state.
+
+The Enactr `release` flow is manual-only while the GitHub and Enactr
+implementations coexist. Before doing any release work, it verifies that an
+existing tag points to the run commit and exits without publication when the
+GitHub release already exists. The push trigger should be enabled only in the
+cutover that disables the GitHub release publisher.
+
+The release publishes the Helm index from a native `gh-pages` worktree; the
+action packages the exact run commit from a GitHub source archive so the
+worktree remains single-purpose.
 
 The original CI topology is represented by separate `ci` and `main` flows.
 Format and Clippy fan out first; Test and the release build then run in
