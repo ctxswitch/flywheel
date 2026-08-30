@@ -166,7 +166,7 @@ pub struct CacheprogArgs {
     pub token: Option<String>,
     #[arg(long, env = "FLYWHEEL_CACHEPROG_DIR")]
     pub cache_dir: Option<PathBuf>,
-    /// Use a fresh local cache for this process and delete it on exit.
+    /// Use a fresh local cache for this process and attempt to delete it on exit.
     #[arg(long, env = "FLYWHEEL_CACHEPROG_EPHEMERAL_CACHE")]
     pub ephemeral_cache: bool,
     /// Label naming the prefetch manifest shared by consecutive builds; defaults to
