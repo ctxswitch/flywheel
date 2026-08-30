@@ -162,6 +162,12 @@ impl RingState {
             }
         }
         let mut inner = self.inner.write().expect("ring state lock");
+        // Whoever held the write lock first may already have re-admitted; the
+        // rest take the continuum it built rather than each rehashing the whole
+        // membership while the lock blocks all routing.
+        if inner.earliest_retry.is_none_or(|deadline| now < deadline) {
+            return Arc::clone(&inner.ring);
+        }
         rebuild(&mut inner, now);
         Arc::clone(&inner.ring)
     }

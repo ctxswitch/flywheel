@@ -1,7 +1,7 @@
 use super::{Candidate, Durability, Evicted, MetadataError, ReferenceRecord};
 use crate::{
     artifact::{ArtifactId, ArtifactMetadata, Digest},
-    channel::{ChannelId, ChannelRecord, ChannelStoreError, Lifecycle},
+    channel::{ChannelId, ChannelRecord},
     storage::records::{decode_record, encode_record},
 };
 use rocksdb::{ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions};
@@ -97,7 +97,9 @@ impl RocksMetadata {
                 batch.put_cf(
                     &eviction,
                     eviction_key(channel, metadata.eligible_at, artifact),
-                    metadata.stored_len.to_le_bytes(),
+                    // The queue row is its key: deadline and artifact are both encoded
+                    // there and the artifact record holds everything else.
+                    b"",
                 );
             }
             if let Some((name, record)) = reference {
@@ -149,7 +151,10 @@ impl RocksMetadata {
                 );
             }
             batch.delete_cf(&artifacts, &key);
-            write_sync(&database, batch)
+            // The same delete `evict` performs, and for the same reason it needs no
+            // fsync: losing the removal leaves a metadata row whose body is already
+            // gone, which the read path self-heals into a miss.
+            database.write(batch).map_err(store_error)
         })
         .await
     }
@@ -159,6 +164,7 @@ impl RocksMetadata {
         channel: ChannelId,
         reference: String,
         record: ReferenceRecord,
+        durability: Durability,
     ) -> Result<(), MetadataError> {
         let database = Arc::clone(&self.database);
         blocking(move || {
@@ -173,7 +179,7 @@ impl RocksMetadata {
                 reference_key(channel, &reference),
                 encode_record(&record)?,
             );
-            write_sync(&database, batch)
+            write(&database, batch, durability)
         })
         .await
     }
@@ -231,7 +237,7 @@ impl RocksMetadata {
                 if !key.starts_with(&prefix) || candidates.len() >= limit {
                     break;
                 }
-                let (eligible_at, artifact) = decode_eviction_key(channel, &key)?;
+                let (eligible_at, artifact) = decode_eviction_key(&key)?;
                 candidates.push(Candidate {
                     eligible_at,
                     artifact,
@@ -270,7 +276,7 @@ impl RocksMetadata {
             batch.put_cf(
                 &eviction,
                 eviction_key(channel, new_eligible_at, artifact),
-                metadata.stored_len.to_le_bytes(),
+                b"",
             );
             batch.put_cf(&artifacts, &key, encode_record(&metadata)?);
             database.write(batch).map_err(store_error)
@@ -320,26 +326,21 @@ impl RocksMetadata {
 }
 
 impl RocksMetadata {
-    pub(crate) async fn create_channel(
-        &self,
-        channel: ChannelRecord,
-    ) -> Result<(), ChannelStoreError> {
+    pub(crate) async fn create_channel(&self, channel: ChannelRecord) -> Result<(), MetadataError> {
         let database = Arc::clone(&self.database);
-        channel_blocking(move || {
-            let family = database
-                .cf_handle(CHANNELS)
-                .ok_or_else(channel_missing_cf)?;
+        blocking(move || {
+            let family = database.cf_handle(CHANNELS).ok_or_else(missing_cf)?;
             let key = channel.id.as_key();
             if database
                 .get_cf(&family, key)
-                .map_err(channel_store_error)?
+                .map_err(store_error)?
                 .is_some()
             {
-                return Err(ChannelStoreError::AlreadyExists);
+                return Err(MetadataError::AlreadyExists);
             }
             let mut batch = WriteBatch::default();
             batch.put_cf(&family, key, encode_record(&channel)?);
-            channel_write_sync(&database, batch)
+            write_sync(&database, batch)
         })
         .await
     }
@@ -347,101 +348,67 @@ impl RocksMetadata {
     pub(crate) async fn channel(
         &self,
         id: ChannelId,
-    ) -> Result<Option<ChannelRecord>, ChannelStoreError> {
+    ) -> Result<Option<ChannelRecord>, MetadataError> {
         let database = Arc::clone(&self.database);
-        channel_blocking(move || {
-            let family = database
-                .cf_handle(CHANNELS)
-                .ok_or_else(channel_missing_cf)?;
+        blocking(move || {
+            let family = database.cf_handle(CHANNELS).ok_or_else(missing_cf)?;
             database
                 .get_cf(&family, id.as_key())
-                .map_err(channel_store_error)?
-                .map(|bytes| decode_record(&bytes).map_err(ChannelStoreError::from))
+                .map_err(store_error)?
+                .map(|bytes| decode_record(&bytes).map_err(MetadataError::from))
                 .transpose()
         })
         .await
     }
 
-    pub(crate) async fn store_channel(
-        &self,
-        channel: ChannelRecord,
-    ) -> Result<(), ChannelStoreError> {
+    pub(crate) async fn store_channel(&self, channel: ChannelRecord) -> Result<(), MetadataError> {
         let database = Arc::clone(&self.database);
-        channel_blocking(move || {
-            let family = database
-                .cf_handle(CHANNELS)
-                .ok_or_else(channel_missing_cf)?;
+        blocking(move || {
+            let family = database.cf_handle(CHANNELS).ok_or_else(missing_cf)?;
             let mut batch = WriteBatch::default();
             batch.put_cf(&family, channel.id.as_key(), encode_record(&channel)?);
-            channel_write_sync(&database, batch)
+            write_sync(&database, batch)
         })
         .await
     }
 
-    pub(crate) async fn deleting_channels(&self) -> Result<Vec<ChannelRecord>, ChannelStoreError> {
+    pub(crate) async fn channels(&self) -> Result<Vec<ChannelRecord>, MetadataError> {
         let database = Arc::clone(&self.database);
-        channel_blocking(move || {
-            let family = database
-                .cf_handle(CHANNELS)
-                .ok_or_else(channel_missing_cf)?;
+        blocking(move || {
+            let family = database.cf_handle(CHANNELS).ok_or_else(missing_cf)?;
             database
                 .iterator_cf(&family, IteratorMode::Start)
                 .map(|item| {
-                    let (_, bytes) = item.map_err(channel_store_error)?;
-                    decode_record::<ChannelRecord>(&bytes).map_err(ChannelStoreError::from)
-                })
-                .filter(
-                    |result| !matches!(result, Ok(record) if record.state != Lifecycle::Deleting),
-                )
-                .collect()
-        })
-        .await
-    }
-
-    pub(crate) async fn channels(&self) -> Result<Vec<ChannelRecord>, ChannelStoreError> {
-        let database = Arc::clone(&self.database);
-        channel_blocking(move || {
-            let family = database
-                .cf_handle(CHANNELS)
-                .ok_or_else(channel_missing_cf)?;
-            database
-                .iterator_cf(&family, IteratorMode::Start)
-                .map(|item| {
-                    let (_, bytes) = item.map_err(channel_store_error)?;
-                    decode_record::<ChannelRecord>(&bytes).map_err(ChannelStoreError::from)
+                    let (_, bytes) = item.map_err(store_error)?;
+                    decode_record::<ChannelRecord>(&bytes).map_err(MetadataError::from)
                 })
                 .collect()
         })
         .await
     }
 
-    pub(crate) async fn delete_channel_data(&self, id: ChannelId) -> Result<(), ChannelStoreError> {
+    pub(crate) async fn delete_channel_data(&self, id: ChannelId) -> Result<(), MetadataError> {
         let database = Arc::clone(&self.database);
-        channel_blocking(move || {
-            let prefix = id.as_key().to_vec();
-            let end = prefix_end(&prefix);
+        blocking(move || {
+            let prefix = id.as_key();
+            let end = prefix_end(prefix);
             let mut batch = WriteBatch::default();
             for name in [ARTIFACTS, REFERENCES, EVICTION] {
-                let family = database.cf_handle(name).ok_or_else(channel_missing_cf)?;
-                batch.delete_range_cf(&family, &prefix, &end);
+                let family = database.cf_handle(name).ok_or_else(missing_cf)?;
+                batch.delete_range_cf(&family, prefix, end);
             }
-            channel_write_sync(&database, batch)
+            write_sync(&database, batch)
         })
         .await
     }
 
-    pub(crate) async fn finish_channel_deletion(
-        &self,
-        id: ChannelId,
-    ) -> Result<(), ChannelStoreError> {
+    pub(crate) async fn finish_channel_deletion(&self, id: ChannelId) -> Result<(), MetadataError> {
         let database = Arc::clone(&self.database);
-        channel_blocking(move || {
-            let channels = database
-                .cf_handle(CHANNELS)
-                .ok_or_else(channel_missing_cf)?;
+        blocking(move || {
+            let channels = database.cf_handle(CHANNELS).ok_or_else(missing_cf)?;
             let mut batch = WriteBatch::default();
             batch.delete_cf(&channels, id.as_key());
-            channel_write_sync(&database, batch)
+            write_sync(&database, batch)
         })
         .await
     }
@@ -467,39 +434,48 @@ fn write_sync(database: &DB, batch: WriteBatch) -> Result<(), MetadataError> {
 }
 
 fn artifact_key(channel: ChannelId, artifact: ArtifactId) -> Vec<u8> {
-    let mut key = channel.as_key().to_vec();
-    key.extend_from_slice(artifact.digest().as_bytes());
+    let prefix = channel.as_key();
+    let digest = artifact.digest();
+    let digest = digest.as_bytes();
+    let mut key = Vec::with_capacity(prefix.len() + digest.len());
+    key.extend_from_slice(&prefix);
+    key.extend_from_slice(digest);
     key
 }
 
 fn reference_key(channel: ChannelId, reference: &str) -> Vec<u8> {
-    let mut key = channel.as_key().to_vec();
+    let prefix = channel.as_key();
+    let mut key = Vec::with_capacity(prefix.len() + reference.len());
+    key.extend_from_slice(&prefix);
     key.extend_from_slice(reference.as_bytes());
     key
 }
 
 fn eviction_key(channel: ChannelId, eligible_at: u64, artifact: ArtifactId) -> Vec<u8> {
-    let mut key = channel.as_key().to_vec();
+    let prefix = channel.as_key();
+    let digest = artifact.digest();
+    let digest = digest.as_bytes();
+    let mut key = Vec::with_capacity(prefix.len() + 8 + digest.len());
+    key.extend_from_slice(&prefix);
     key.extend_from_slice(&eligible_at.to_be_bytes());
-    key.extend_from_slice(artifact.digest().as_bytes());
+    key.extend_from_slice(digest);
     key
 }
 
-fn decode_eviction_key(channel: ChannelId, key: &[u8]) -> Result<(u64, ArtifactId), MetadataError> {
-    let prefix = channel.as_key();
-    if !key.starts_with(&prefix) || key.len() != prefix.len() + 8 + 32 {
-        return Err(MetadataError::Store("invalid eviction key".to_owned()));
-    }
-    let eligible_at = u64::from_be_bytes(
-        key[prefix.len()..prefix.len() + 8]
-            .try_into()
-            .map_err(|_| MetadataError::Store("invalid eviction deadline".to_owned()))?,
-    );
-    let digest = key[prefix.len() + 8..]
+/// Splits a queue key into its deadline and artifact. The caller has already matched
+/// the channel prefix, so the whole-key length is the only thing left to check.
+fn decode_eviction_key(key: &[u8]) -> Result<(u64, ArtifactId), MetadataError> {
+    const DEADLINE_AT: usize = ulid::ULID_LEN;
+    const DIGEST_AT: usize = DEADLINE_AT + 8;
+    let key: &[u8; DIGEST_AT + 32] = key
         .try_into()
-        .map_err(|_| MetadataError::Store("invalid eviction digest".to_owned()))?;
+        .map_err(|_| MetadataError::Store("invalid eviction key".to_owned()))?;
+    let mut deadline = [0_u8; 8];
+    deadline.copy_from_slice(&key[DEADLINE_AT..DIGEST_AT]);
+    let mut digest = [0_u8; 32];
+    digest.copy_from_slice(&key[DIGEST_AT..]);
     Ok((
-        eligible_at,
+        u64::from_be_bytes(deadline),
         ArtifactId::from_digest(Digest::from_bytes(digest)),
     ))
 }
@@ -512,37 +488,10 @@ fn store_error(error: impl std::fmt::Display) -> MetadataError {
     MetadataError::Store(error.to_string())
 }
 
-async fn channel_blocking<T: Send + 'static>(
-    operation: impl FnOnce() -> Result<T, ChannelStoreError> + Send + 'static,
-) -> Result<T, ChannelStoreError> {
-    tokio::task::spawn_blocking(operation).await?
-}
-
-fn channel_write_sync(database: &DB, batch: WriteBatch) -> Result<(), ChannelStoreError> {
-    let mut options = WriteOptions::default();
-    options.set_sync(true);
-    database
-        .write_opt(batch, &options)
-        .map_err(channel_store_error)
-}
-
-fn channel_missing_cf() -> ChannelStoreError {
-    ChannelStoreError::Store("missing RocksDB column family".to_owned())
-}
-
-fn channel_store_error(error: impl std::fmt::Display) -> ChannelStoreError {
-    ChannelStoreError::Store(error.to_string())
-}
-
-fn prefix_end(prefix: &[u8]) -> Vec<u8> {
-    let mut end = prefix.to_vec();
-    for byte in end.iter_mut().rev() {
-        if *byte != u8::MAX {
-            *byte += 1;
-            return end;
-        }
-        *byte = 0;
-    }
-    end.push(0);
-    end
+/// The exclusive upper bound of a channel's key range. A channel key is canonical
+/// Crockford base32 text, so its last byte is an ASCII digit or capital letter and
+/// incrementing it can never carry.
+fn prefix_end(mut prefix: [u8; ulid::ULID_LEN]) -> [u8; ulid::ULID_LEN] {
+    prefix[ulid::ULID_LEN - 1] += 1;
+    prefix
 }

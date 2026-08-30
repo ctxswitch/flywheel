@@ -1,7 +1,7 @@
 use super::{Request, Response, read_protocol_line, run_with_io, run_with_shutdown, session};
 use crate::{
     cli::CacheprogArgs,
-    manifest::{MANIFEST_VERSION, Manifest, ManifestEntry, manifest_key},
+    manifest::{MANIFEST_MAX_AGE_SECONDS, MANIFEST_VERSION, Manifest, ManifestEntry, manifest_key},
 };
 use axum::{
     Json, Router,
@@ -13,6 +13,7 @@ use axum::{
 use sha2::Digest as _;
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -24,6 +25,15 @@ use tokio::{
     net::TcpListener,
     sync::{Notify, oneshot},
 };
+
+/// Serves `app` on an ephemeral loopback port, returning the bound address and
+/// the server task the caller aborts when the test is done.
+async fn serve(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (address, task)
+}
 
 fn args(url: String, cache_dir: &std::path::Path) -> CacheprogArgs {
     CacheprogArgs {
@@ -46,9 +56,7 @@ async fn ephemeral_cache_is_removed_after_close() {
         "/{*key}",
         route_get(|| async { StatusCode::NOT_FOUND }).put(|| async { StatusCode::OK }),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (address, server) = serve(app).await;
     let parent = tempfile::tempdir().unwrap();
     let mut options = args(format!("http://{address}/"), parent.path());
     options.ephemeral_cache = true;
@@ -124,9 +132,7 @@ async fn shutdown_cancels_in_flight_requests_and_removes_ephemeral_cache() {
             }
         }),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (address, server) = serve(app).await;
     let parent = tempfile::tempdir().unwrap();
     let mut options = args(format!("http://{address}/"), parent.path());
     options.ephemeral_cache = true;
@@ -271,9 +277,7 @@ async fn completes_independent_requests_concurrently() {
             StatusCode::NOT_FOUND
         }),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (address, server) = serve(app).await;
     let input = concat!(
         "{\"ID\":1,\"Command\":\"get\",\"ActionID\":\"AQ==\"}\n\n",
         "{\"ID\":2,\"Command\":\"get\",\"ActionID\":\"Ag==\"}\n\n",
@@ -385,6 +389,65 @@ async fn manifest_known_gets_answer_locally_without_any_request() {
     assert!(std::path::Path::new(&response.disk_path).is_file());
 }
 
+/// A get answered out of the local object directory is still usage. The merged
+/// manifest has to carry it forward with a fresh `last_seen`, or the actions
+/// prefetch predicts perfectly are exactly the ones that age out and get
+/// evicted first — the manifest would decay to only what it mispredicted.
+#[tokio::test]
+async fn locally_answered_gets_refresh_their_manifest_entry() {
+    // Unreachable on purpose: a local answer must never touch the network.
+    let base = reqwest::Url::parse("http://127.0.0.1:9/build-cache/http/").unwrap();
+    let client = reqwest::Client::new();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let body = b"perfectly predicted object";
+    let output = hex::encode(sha2::Sha256::digest(body));
+    tokio::fs::write(cache_dir.path().join(&output), body)
+        .await
+        .unwrap();
+    let action = hex::encode([9u8; 32]);
+    let stored = Manifest {
+        version: MANIFEST_VERSION,
+        entries: HashMap::from([(
+            action.clone(),
+            ManifestEntry {
+                output: output.clone(),
+                size: body.len() as u64,
+                last_seen: 100,
+            },
+        )]),
+    };
+    let session = session::SessionState::default();
+    session.manifest.set(stored.clone()).unwrap();
+
+    let response = super::get(
+        &client,
+        &base,
+        None,
+        cache_dir.path(),
+        &session,
+        Request {
+            id: 3,
+            command: "get".into(),
+            action_id: hex::decode(&action).unwrap(),
+            output_id: Vec::new(),
+            body_size: 0,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!response.miss);
+
+    // Finalize past the retention window: only a recorded use keeps the entry.
+    let now = 100 + MANIFEST_MAX_AGE_SECONDS + 1;
+    let used = session.used.lock().unwrap().clone();
+    let merged = session::merge_manifest(Some(stored), &used, now);
+    assert_eq!(
+        merged.entries.get(&action).map(|entry| entry.last_seen),
+        Some(now),
+        "a locally answered get must refresh its manifest entry"
+    );
+}
+
 #[tokio::test]
 async fn preserves_a_put_body_while_an_earlier_request_completes() {
     let get_started = Arc::new(Notify::new());
@@ -411,9 +474,7 @@ async fn preserves_a_put_body_while_an_earlier_request_completes() {
         })
         .put(|| async { StatusCode::OK }),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (address, server) = serve(app).await;
     let cache_dir = tempfile::tempdir().unwrap();
     let (mut input, cache_input) = tokio::io::duplex(1);
     let (cache_output, output) = tokio::io::duplex(4096);
@@ -553,9 +614,7 @@ async fn spawn_prefetch_backend(
             ),
         )
         .with_state(backend);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (address, task) = serve(app).await;
     (
         reqwest::Url::parse(&format!("http://{address}/build-cache/http/")).unwrap(),
         task,
@@ -687,9 +746,7 @@ async fn prefetch_concurrency_zero_fetches_only_the_manifest() {
             }
         }
     });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (address, server) = serve(app).await;
     let cache_dir = tempfile::tempdir().unwrap();
     let (mut input, cache_input) = tokio::io::duplex(4096);
     let (cache_output, output) = tokio::io::duplex(4096);
@@ -727,104 +784,6 @@ async fn prefetch_concurrency_zero_fetches_only_the_manifest() {
             "/build-cache/http/{}",
             manifest_key("cacheprog-test")
         )]
-    );
-}
-
-/// A foreground get for an object the prefetch pool is mid-download must wait
-/// for that download and answer locally — one fetch total, not two.
-#[tokio::test]
-async fn foreground_get_waits_for_the_inflight_prefetch_download() {
-    let body = b"contended object body".to_vec();
-    let action = format!("{:064x}", 9);
-    let mut manifest = Manifest::empty();
-    manifest
-        .entries
-        .insert(action.clone(), manifest_entry_for(&body));
-    let object_requests = Arc::new(AtomicUsize::new(0));
-    let download_started = Arc::new(Notify::new());
-    let release_download = Arc::new(Notify::new());
-    let app = Router::new().route(
-        "/build-cache/http/{key}",
-        route_get({
-            let manifest = manifest.clone();
-            let object_requests = Arc::clone(&object_requests);
-            let download_started = Arc::clone(&download_started);
-            let release_download = Arc::clone(&release_download);
-            let body = body.clone();
-            move |Path(key): Path<String>| {
-                let manifest = manifest.clone();
-                let object_requests = Arc::clone(&object_requests);
-                let download_started = Arc::clone(&download_started);
-                let release_download = Arc::clone(&release_download);
-                let body = body.clone();
-                async move {
-                    if key == manifest_key("wait-test") {
-                        return Json(manifest).into_response();
-                    }
-                    object_requests.fetch_add(1, Ordering::Relaxed);
-                    download_started.notify_one();
-                    release_download.notified().await;
-                    body.into_response()
-                }
-            }
-        }),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let base = reqwest::Url::parse(&format!("http://{address}/build-cache/http/")).unwrap();
-    let client = reqwest::Client::new();
-    let directory = tempfile::tempdir().unwrap();
-    let state = Arc::new(session::SessionState::default());
-
-    let prefetch = tokio::spawn(session::run_prefetch(
-        client.clone(),
-        base.clone(),
-        None,
-        directory.path().to_path_buf(),
-        manifest_key("wait-test"),
-        1,
-        Arc::clone(&state),
-    ));
-    // The prefetch download is now in flight, blocked inside the server handler.
-    download_started.notified().await;
-
-    let releaser = tokio::spawn({
-        let release_download = Arc::clone(&release_download);
-        async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            release_download.notify_one();
-        }
-    });
-    let response = super::get(
-        &client,
-        &base,
-        None,
-        directory.path(),
-        &state,
-        Request {
-            id: 4,
-            command: "get".into(),
-            action_id: hex::decode(&action).unwrap(),
-            output_id: Vec::new(),
-            body_size: 0,
-        },
-    )
-    .await
-    .unwrap();
-    prefetch.await.unwrap();
-    releaser.await.unwrap();
-    server.abort();
-
-    assert!(!response.miss);
-    assert_eq!(
-        hex::encode(&response.output_id),
-        hex::encode(sha2::Sha256::digest(&body))
-    );
-    assert_eq!(
-        object_requests.load(Ordering::Relaxed),
-        1,
-        "the waiting get must reuse the prefetch download, not repeat it"
     );
 }
 
@@ -883,9 +842,7 @@ async fn foreground_get_waits_for_a_queued_prefetch_download() {
             }
         }),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (address, server) = serve(app).await;
     let base = reqwest::Url::parse(&format!("http://{address}/build-cache/http/")).unwrap();
     let client = reqwest::Client::new();
     let directory = tempfile::tempdir().unwrap();

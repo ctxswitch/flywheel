@@ -9,19 +9,28 @@ pub struct Reference(String);
 impl Reference {
     pub fn parse(value: impl Into<String>) -> Result<Self, ReferenceError> {
         let value = value.into();
-        let valid = !value.is_empty()
-            && value.len() <= MAX_REFERENCE_LEN
-            && value.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
-            });
-        if !valid {
+        if !Self::is_valid(&value) {
             return Err(ReferenceError);
         }
         Ok(Self(value))
     }
 
+    /// The same rule `parse` applies, for callers that only need the verdict and
+    /// would otherwise allocate an owned reference just to drop it.
+    pub fn is_valid(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= MAX_REFERENCE_LEN
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            })
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
     }
 }
 

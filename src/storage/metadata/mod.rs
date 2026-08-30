@@ -13,10 +13,11 @@ pub struct ReferenceRecord {
     pub last_modified: Option<String>,
 }
 
-/// Whether a publication batch must be synchronously flushed before it is
+/// Whether a metadata batch must be synchronously flushed before it is
 /// acknowledged. Raw artifact and Bazel CAS publications are `Durable`; build-cache
-/// and proxy publications are `BestEffort` because the body is already complete and
-/// any crash outcome is a hit, a self-healing miss, or an orphan file.
+/// and proxy publications — and the reference bindings that accompany them, including
+/// the rebind on an upstream 304 — are `BestEffort` because the body is already
+/// complete and any crash outcome is a hit, a self-healing miss, or an orphan file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Durability {
     Durable,
@@ -47,6 +48,8 @@ pub enum MetadataError {
     Store(String),
     #[error("durable store format is incompatible: {0}")]
     IncompatibleStore(String),
+    #[error("channel already exists")]
+    AlreadyExists,
     #[error("durable record failed: {0}")]
     Record(#[from] crate::storage::records::RecordError),
     #[error("metadata task failed: {0}")]

@@ -1,9 +1,10 @@
 use crate::{
     artifact::{ArtifactId, ArtifactMetadata, StoredEncoding},
+    cache::Mode,
     cache::recent_use::RecentUse,
-    cache::space::{Mode, SpaceLedger},
+    cache::space::SpaceLedger,
     cache::stripes::Stripes,
-    channel::{ChannelGates, ChannelId, ChannelStoreError, Lifecycle},
+    channel::{ChannelGates, ChannelId, Lifecycle},
     clock::Clock,
     storage::{
         local::{ArtifactFiles, FilePublication, LocalError, StageOutcome, StagedArtifact},
@@ -114,28 +115,17 @@ impl CacheService {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
-        match self.publish_impl(request).await? {
+        match self.publish_or_reject(request).await? {
             Admission::Published(publication) => Ok(publication),
             Admission::Rejected(_) => Err(CacheError::Local(LocalError::OutOfSpace)),
         }
     }
 
-    /// Content-addressed publication that hands the body back instead of failing when
-    /// the up-front reservation is rejected under disk pressure. The package proxy uses
-    /// this so a bypassed download streams the untouched body straight to the client —
-    /// never buffered, never re-fetched.
+    /// Publication that hands the body back instead of failing when the up-front
+    /// reservation is rejected under disk pressure. The package proxy uses this so a
+    /// bypassed download streams the untouched body straight to the client — never
+    /// buffered, never re-fetched.
     pub async fn publish_or_reject<S, E>(
-        &self,
-        request: PublishRequest<S>,
-    ) -> Result<Admission<S>, CacheError>
-    where
-        S: Stream<Item = Result<Bytes, E>> + Unpin,
-        E: std::fmt::Display,
-    {
-        self.publish_impl(request).await
-    }
-
-    async fn publish_impl<S, E>(
         &self,
         request: PublishRequest<S>,
     ) -> Result<Admission<S>, CacheError>
@@ -222,8 +212,15 @@ impl CacheService {
         reference: String,
         artifact: ArtifactId,
     ) -> Result<(), CacheError> {
-        self.bind_reference_with_validators(channel, reference, artifact, None, None)
-            .await
+        self.bind_reference_with_validators(
+            channel,
+            reference,
+            artifact,
+            None,
+            None,
+            Durability::Durable,
+        )
+        .await
     }
 
     pub(crate) async fn bind_reference_with_validators(
@@ -233,9 +230,9 @@ impl CacheService {
         artifact: ArtifactId,
         etag: Option<String>,
         last_modified: Option<String>,
+        durability: Durability,
     ) -> Result<(), CacheError> {
-        let _gate = self.channel_fence(channel).await?;
-        let _stripe = self.stripes.reference(channel, &reference).await;
+        let (_gate, _) = self.channel_fence(channel).await?;
         self.metadata
             .bind_reference(
                 channel,
@@ -246,6 +243,7 @@ impl CacheService {
                     etag,
                     last_modified,
                 },
+                durability,
             )
             .await?;
         Ok(())
@@ -264,8 +262,7 @@ impl CacheService {
         channel: ChannelId,
         reference: &str,
     ) -> Result<(), CacheError> {
-        let _gate = self.channel_fence(channel).await?;
-        let _stripe = self.stripes.reference(channel, reference).await;
+        let (_gate, _) = self.channel_fence(channel).await?;
         self.metadata.delete_reference(channel, reference).await?;
         Ok(())
     }
@@ -312,11 +309,7 @@ impl CacheService {
     /// channel rotates each pass so an early-exhausted budget does not starve the tail.
     pub async fn run_maintenance_once(&self, limit: usize) -> Result<usize, CacheError> {
         self.space.refresh();
-        self.metrics.record_space(
-            self.space.free_observed(),
-            self.space.reserved(),
-            self.space.committed_since(),
-        );
+        self.metrics.record_space(self.space.snapshot());
         let mode = self.space.mode();
         let now = self.clock.now();
         let mut channels = self.channels().await?;
@@ -368,12 +361,11 @@ impl CacheService {
                 // candidate row is not stale before anything is unlinked; under the
                 // stripe nothing can requeue or republish in between (`commit_staged`
                 // takes the same stripe), so `evict` then removes the row it just saw.
-                match self.metadata.artifact(channel, candidate.artifact).await? {
-                    Some(metadata) if metadata.eligible_at == candidate.eligible_at => {
-                        self.files.remove(channel, candidate.artifact).await?;
-                    }
-                    // Requeued or already gone: let `evict` drop the stale queue row.
-                    _ => {}
+                // Requeued or already gone: let `evict` drop the stale queue row.
+                if let Some(metadata) = self.metadata.artifact(channel, candidate.artifact).await?
+                    && metadata.eligible_at == candidate.eligible_at
+                {
+                    self.files.remove(channel, candidate.artifact).await?;
                 }
                 match self
                     .metadata
@@ -439,15 +431,8 @@ impl CacheService {
         // Fence the final mutation against channel deletion: acquire the shared channel
         // gate and recheck `active` so a body staged before deletion cannot be published
         // back into a  channel whose ranges are being (or have been) removed.
-        let _gate = match self.channel_fence(channel).await {
-            Ok(gate) => gate,
-            Err(error) => {
-                staged.discard().await;
-                return Err(error);
-            }
-        };
-        let expiry_seconds = match self.expiry_seconds(channel).await {
-            Ok(expiry_seconds) => expiry_seconds,
+        let (_gate, expiry_seconds) = match self.channel_fence(channel).await {
+            Ok(fence) => fence,
             Err(error) => {
                 staged.discard().await;
                 return Err(error);
@@ -524,17 +509,18 @@ impl CacheService {
     }
 
     /// Acquires the shared channel lifecycle gate (read side) and rechecks that the
-    /// channel is still active, returning the guard to hold across a final mutation.
+    /// channel is still active, returning the guard to hold across a final mutation
+    /// along with the expiry carried by the very record the recheck just read.
     /// A deletion takes the write side, so holding this read guard blocks deletion from
     /// wiping the channel mid-commit, and the active recheck rejects a mutation into a
     /// channel whose deletion has already begun to tear it down.
     async fn channel_fence(
         &self,
         channel: ChannelId,
-    ) -> Result<OwnedRwLockReadGuard<()>, CacheError> {
+    ) -> Result<(OwnedRwLockReadGuard<()>, u64), CacheError> {
         let guard = self.channel_gates.gate(channel).read_owned().await;
         match self.metadata.channel(channel).await? {
-            Some(record) if record.state == Lifecycle::Active => Ok(guard),
+            Some(record) if record.state == Lifecycle::Active => Ok((guard, record.expiry_seconds)),
             Some(_) => Err(CacheError::ChannelDeleting),
             None => Err(CacheError::MissingChannel),
         }
@@ -547,8 +533,6 @@ pub enum CacheError {
     Local(#[from] LocalError),
     #[error(transparent)]
     Metadata(#[from] MetadataError),
-    #[error(transparent)]
-    ChannelStore(#[from] ChannelStoreError),
     #[error("channel does not exist")]
     MissingChannel,
     #[error("channel is being deleted")]

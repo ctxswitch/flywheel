@@ -51,7 +51,7 @@ pub struct RingMember {
 #[derive(Debug)]
 pub struct Ring {
     members: Vec<RingMember>,
-    points: Vec<(u64, u32)>,
+    points: Vec<(u64, usize)>,
     fingerprint: String,
 }
 
@@ -69,7 +69,7 @@ impl Ring {
                 hasher.update(vnode.to_be_bytes());
                 let digest = hasher.finalize();
                 let point = u64::from_be_bytes(digest[..8].try_into().expect("sha256 slice"));
-                points.push((point, u32::try_from(index).expect("member count fits u32")));
+                points.push((point, index));
             }
         }
         points.sort_unstable();
@@ -100,13 +100,9 @@ impl Ring {
         if self.points.is_empty() {
             return None;
         }
-        let index = self
-            .points
-            .partition_point(|(point, _)| *point < position)
-            .checked_rem(self.points.len())
-            .expect("points is non-empty");
+        let index = self.points.partition_point(|(point, _)| *point < position) % self.points.len();
         let (_, member) = self.points[index];
-        Some(&self.members[member as usize])
+        Some(&self.members[member])
     }
 
     /// Hex SHA-256 of the sorted member IDs joined with `\n`. Diagnostic only.

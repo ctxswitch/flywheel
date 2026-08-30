@@ -10,7 +10,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use tempfile::TempDir;
-use tower::ServiceExt;
+
+#[path = "common/mod.rs"]
+mod common;
+use common::call;
 
 struct ManualClock(AtomicU64);
 
@@ -54,7 +57,7 @@ fn artifact(body: &[u8]) -> (String, String) {
 }
 
 async fn status(app: axum::Router, request: Request<Body>) -> StatusCode {
-    app.oneshot(request).await.unwrap().status()
+    call(app, request).await.status()
 }
 
 // A large free-space configuration that keeps the controller firmly in Normal mode so
@@ -174,18 +177,16 @@ async fn maintenance_uses_each_active_channels_persisted_expiry() {
         .await
         .unwrap();
     let app = flywheel.router();
-    let registered = app
-        .clone()
-        .oneshot(
-            Request::post("/channels")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({"access_control": false, "expiry_seconds": 10}).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let registered = call(
+        app.clone(),
+        Request::post("/channels")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"access_control": false, "expiry_seconds": 10}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
     let registered: serde_json::Value =
         serde_json::from_slice(&to_bytes(registered.into_body(), usize::MAX).await.unwrap())
             .unwrap();

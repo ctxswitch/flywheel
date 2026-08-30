@@ -586,7 +586,7 @@ GOCACHEPROG='flywheel cacheprog \
 | `--url` | `FLYWHEEL_CACHEPROG_URL` | Generic HTTP build-cache base URL |
 | `--token` | `FLYWHEEL_CACHEPROG_TOKEN` | Protected channel credential |
 | `--cache-dir` | `FLYWHEEL_CACHEPROG_DIR` | Parent of the persistent `flywheel-cacheprog/` directory |
-| `--ephemeral-cache` | `FLYWHEEL_CACHEPROG_EPHEMERAL_CACHE` | Use a fresh local cache for this process and delete it on exit |
+| `--ephemeral-cache` | `FLYWHEEL_CACHEPROG_EPHEMERAL_CACHE` | Use a fresh local cache for this process and attempt to delete it on exit |
 | `--session` | `FLYWHEEL_SESSION` | Stable label for the prefetch manifest |
 | `--prune-days` | `FLYWHEEL_CACHEPROG_PRUNE_DAYS` | Local object age limit; default 14, `0` disables pruning |
 | `--prefetch-concurrency` | `FLYWHEEL_CACHEPROG_PREFETCH_CONCURRENCY` | Bound on parallel prefetch downloads; default 8, `0` disables downloads but keeps the single manifest GET |
@@ -598,9 +598,10 @@ cache behavior.
 
 Use `--ephemeral-cache` to prevent reuse between cacheprog processes. The helper creates a
 fresh child under `--cache-dir` (or the system temporary directory), uses it normally for
-the process, and deletes it after close. On `SIGINT`, cacheprog stops reading new protocol
-messages, cancels requests still in flight, finalizes the session manifest, and performs the
-same local-cache cleanup as a protocol close.
+the process, and attempts to delete it after close. Cleanup is best-effort so a filesystem
+error after a successful build does not turn the build into a cache failure. On `SIGINT`,
+cacheprog stops reading new protocol messages, cancels requests still in flight, finalizes
+the session manifest, and performs the same local-cache cleanup as a protocol close.
 
 At startup the helper issues one plain GET of the session's manifest key — the same
 ordinary build-cache request its close-time manifest update uses — then warms its object

@@ -179,8 +179,6 @@ where
         args.prefetch_concurrency,
         Arc::clone(&session_state),
     )));
-    let mut session_finished = false;
-
     write_response(
         &mut writer,
         &Response {
@@ -206,7 +204,6 @@ where
         {
             finish_session(
                 &mut prefetch_task,
-                &mut session_finished,
                 &client,
                 &base,
                 args.token.as_deref(),
@@ -225,29 +222,16 @@ where
             break;
         }
 
-        let event = if close_id.is_some() {
-            tokio::select! {
-                biased;
-                () = &mut shutdown => Event::Shutdown,
-                response = in_flight.next() => Event::Response(
-                    response.expect("in-flight request was checked")
-                ),
-            }
-        } else if in_flight.is_empty() {
-            tokio::select! {
-                biased;
-                () = &mut shutdown => Event::Shutdown,
-                message = reader.next_message() => Event::Input(message?),
-            }
-        } else {
-            tokio::select! {
-                biased;
-                () = &mut shutdown => Event::Shutdown,
-                message = reader.next_message() => Event::Input(message?),
-                response = in_flight.next() => {
-                    Event::Response(response.expect("in-flight request was checked"))
-                },
-            }
+        // Shutdown first, then input, then completions: a `close` stops the helper
+        // reading further requests, and an empty `FuturesUnordered` would otherwise
+        // report completion immediately and spin.
+        let event = tokio::select! {
+            biased;
+            () = &mut shutdown => Event::Shutdown,
+            message = reader.next_message(), if close_id.is_none() => Event::Input(message?),
+            response = in_flight.next(), if !in_flight.is_empty() => {
+                Event::Response(response.expect("in-flight request was checked"))
+            },
         };
 
         match event {
@@ -288,7 +272,6 @@ where
     }
     finish_session(
         &mut prefetch_task,
-        &mut session_finished,
         &client,
         &base,
         args.token.as_deref(),
@@ -297,7 +280,9 @@ where
     )
     .await;
     if args.ephemeral_cache {
-        tokio::fs::remove_dir_all(&directory).await?;
+        // Best-effort, like `prune_stale_files`: a cleanup failure after a successful
+        // build would otherwise exit non-zero, which Go reports as a cache error.
+        let _ = tokio::fs::remove_dir_all(&directory).await;
     } else {
         let object_max_age =
             (args.prune_days > 0).then(|| Duration::from_secs(args.prune_days * 24 * 60 * 60));
@@ -306,20 +291,18 @@ where
     Ok(())
 }
 
-/// Ends the session exactly once: stop predicting, then persist what this build
-/// used so the next one can prefetch it.
+/// Ends the session: stop predicting, then persist what this build used so the next
+/// one can prefetch it. Both halves are idempotent — the join handle is taken out of
+/// the option and `finalize` drains the usage map — so the close path calling this and
+/// then falling through to the same call after the loop costs nothing.
 async fn finish_session(
     task: &mut Option<tokio::task::JoinHandle<()>>,
-    finished: &mut bool,
     client: &reqwest::Client,
     base: &reqwest::Url,
     token: Option<&str>,
     manifest_key: &str,
     state: &SessionState,
 ) {
-    if std::mem::replace(finished, true) {
-        return;
-    }
     if let Some(task) = task.take() {
         task.abort();
         let _ = task.await;
@@ -434,13 +417,17 @@ async fn get(
         // of downloading the same bytes again: Go's own build parallelism bounds
         // the waiters, and the signal fires however the download ends, so a
         // failed one simply falls through to the ordinary request below.
-        if !file_has_size(&path, entry.size).await
-            && let Some(mut pending) = session.download_in_progress(&entry.output)
-        {
+        let mut present = file_has_size(&path, entry.size).await;
+        if !present && let Some(mut pending) = session.download_in_progress(&entry.output) {
             let _ = pending.changed().await;
+            present = file_has_size(&path, entry.size).await;
         }
-        if file_has_size(&path, entry.size).await {
+        if present {
             touch(&path);
+            // A local answer is still a use: without this the manifest retains the
+            // entry against its stale `last_seen`, so the best-predicted actions
+            // are the first to age out and the first evicted at the entry cap.
+            session.record_used(action, entry.output.clone(), entry.size);
             return Ok(Response {
                 id: request.id,
                 output_id: hex::decode(&entry.output)?,
@@ -462,7 +449,7 @@ async fn get(
         .get(reqwest::header::ETAG)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body = response.bytes().await?.to_vec();
+    let body = response.bytes().await?;
     // The put-side check guarantees the stored body's hash IS the output ID.
     let output = hex::encode(Sha256::digest(&body));
     if let Some(expected) = etag
@@ -558,8 +545,15 @@ async fn write_atomic(path: &Path, body: &[u8]) -> anyhow::Result<()> {
         return Err(error.into());
     }
     drop(file);
-    if let Err(error) = tokio::fs::rename(&temporary, path).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
+    publish_temporary(&temporary, path).await
+}
+
+/// Moves a fully written temporary file into its final place. Losing the rename to a
+/// concurrent writer of the same content-addressed object is not a failure: the
+/// temporary is dropped and the file that won stands.
+async fn publish_temporary(temporary: &Path, path: &Path) -> anyhow::Result<()> {
+    if let Err(error) = tokio::fs::rename(temporary, path).await {
+        let _ = tokio::fs::remove_file(temporary).await;
         if !tokio::fs::try_exists(path).await? {
             return Err(error.into());
         }

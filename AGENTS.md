@@ -43,9 +43,12 @@ src/
 
 ### Integration tests
 
-Integration tests live in `tests/integration/`. Cargo auto-discovers them.
-They exercise full Flywheel instances with HTTP routers, real TCP, and
-tempfile-backed storage.
+Integration tests live in `tests/integration/`. Cargo does not auto-discover
+files in that subdirectory, so each one is declared as a `[[test]]` target in
+`Cargo.toml`; a new file needs a new entry there. They exercise full Flywheel
+instances with HTTP routers, real TCP, and tempfile-backed storage. Helpers
+shared between them live in `tests/integration/common/mod.rs`, pulled in with
+`#[path = "common/mod.rs"] mod common;` rather than declared as a target.
 
 ### What to test
 

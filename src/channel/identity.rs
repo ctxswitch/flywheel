@@ -9,19 +9,16 @@ impl ChannelId {
     pub const DEFAULT: Self = Self(Ulid::nil());
 
     pub fn new() -> Self {
-        loop {
-            let id = Self(Ulid::new());
-            if id != Self::DEFAULT {
-                return id;
-            }
-        }
+        Self(Ulid::new())
     }
 
-    pub fn as_key(self) -> [u8; 26] {
-        self.to_string()
-            .as_bytes()
-            .try_into()
-            .expect("a ULID is always 26 bytes")
+    /// The channel's durable key prefix: the canonical ULID text, encoded straight
+    /// into a stack buffer. `Display` itself calls `array_to_str`, so the bytes are
+    /// identical to the string form without the intermediate allocation.
+    pub fn as_key(self) -> [u8; ulid::ULID_LEN] {
+        let mut key = [0_u8; ulid::ULID_LEN];
+        self.0.array_to_str(&mut key);
+        key
     }
 }
 

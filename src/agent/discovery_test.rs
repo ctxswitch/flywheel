@@ -100,6 +100,43 @@ fn ejected_member_becomes_eligible_after_the_retry_timeout() {
     assert_eq!(state.ring().members().len(), 2);
 }
 
+/// Re-admission rebuilds the continuum once, not once per concurrent request.
+/// Every caller that queued on the write lock re-checks the retry deadline, so
+/// a degraded cluster does not pay one full rebuild per in-flight request while
+/// the lock blocks all routing; the identical `Arc` proves a single rebuild.
+#[test]
+fn concurrent_readmission_rebuilds_the_continuum_once() {
+    let clock = Arc::new(TestClock(AtomicU64::new(0)));
+    let state = state_with(&clock, 1, 30, three_members());
+    for _ in 0..16 {
+        assert!(state.record_failure("flywheel-1"));
+        clock.advance(30);
+        let barrier = std::sync::Barrier::new(8);
+        let rings: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (state, barrier) = (&state, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        state.ring()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for ring in &rings {
+            assert_eq!(ring.members().len(), 3);
+            assert!(
+                Arc::ptr_eq(ring, &rings[0]),
+                "every concurrent caller must observe the one rebuilt continuum"
+            );
+        }
+    }
+}
+
 #[test]
 fn success_resets_the_consecutive_failure_count() {
     let clock = Arc::new(TestClock(AtomicU64::new(0)));

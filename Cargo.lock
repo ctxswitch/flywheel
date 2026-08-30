@@ -630,7 +630,6 @@ dependencies = [
  "hickory-resolver",
  "html-escape",
  "http",
- "http-body-util",
  "lol_html",
  "postcard",
  "prometheus",

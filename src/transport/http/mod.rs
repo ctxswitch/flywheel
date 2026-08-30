@@ -12,14 +12,17 @@ use crate::{
     },
     proxy::ProxyService,
     reference::Reference,
-    telemetry::{MakeRequestUlid, Metrics, REQUEST_ID_HEADER},
+    telemetry::{
+        MakeRequestUlid, Metrics, PrefetchObservation, REQUEST_ID_HEADER, observe_prefetch_body,
+    },
+    transport::content_length,
 };
 use async_compression::tokio::bufread::ZstdDecoder;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{MatchedPath, Path, Request, State, rejection::JsonRejection},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    extract::{FromRequestParts, MatchedPath, Path, Request, State, rejection::JsonRejection},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -27,7 +30,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{io::SeekFrom, sync::Arc, time::Instant};
+use std::{borrow::Cow, io::SeekFrom, sync::Arc, time::Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tower::ServiceBuilder;
@@ -141,7 +144,10 @@ fn server_request_span(request: &Request) -> tracing::Span {
     )
 }
 
-fn server_request_identity(request: &Request) -> (String, String) {
+/// The span's operation and key for one request. Both borrow out of the request
+/// wherever the path already holds the text; only the multi-segment proxy key is
+/// assembled.
+fn server_request_identity(request: &Request) -> (&str, Cow<'_, str>) {
     let path = request.uri().path();
     let raw_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let segments = match raw_segments.as_slice() {
@@ -149,21 +155,20 @@ fn server_request_identity(request: &Request) -> (String, String) {
         rest => rest,
     };
     match segments {
-        ["artifacts", _algorithm, digest] => ("artifact".to_owned(), (*digest).to_owned()),
-        ["build-cache", "bazel", "cas", hash] => ("artifact".to_owned(), (*hash).to_owned()),
-        ["build-cache", "bazel", "ac", hash] => ("bazel-action".to_owned(), (*hash).to_owned()),
-        ["build-cache", "http", key] => ("http-cache".to_owned(), (*key).to_owned()),
-        ["references", reference] => ("reference".to_owned(), (*reference).to_owned()),
+        ["artifacts", _algorithm, digest] => ("artifact", Cow::Borrowed(*digest)),
+        ["build-cache", "bazel", "cas", hash] => ("artifact", Cow::Borrowed(*hash)),
+        ["build-cache", "bazel", "ac", hash] => ("bazel-action", Cow::Borrowed(*hash)),
+        ["build-cache", "http", key] => ("http-cache", Cow::Borrowed(*key)),
+        ["references", reference] => ("reference", Cow::Borrowed(*reference)),
         ["proxy", protocol, rest @ ..] if !rest.is_empty() => {
-            ((*protocol).to_owned(), rest.join("/"))
+            (*protocol, Cow::Owned(rest.join("/")))
         }
         _ => (
             request
                 .extensions()
                 .get::<MatchedPath>()
-                .map_or("unmatched", MatchedPath::as_str)
-                .to_owned(),
-            String::new(),
+                .map_or("unmatched", MatchedPath::as_str),
+            Cow::Borrowed(""),
         ),
     }
 }
@@ -209,6 +214,8 @@ fn data_router() -> Router<Arc<AppState>> {
         )
 }
 
+/// The `{channel}` capture every data route may carry. Present on the `/channels/{id}`
+/// prefixed forms and absent on the bare ones, which resolve to the default channel.
 #[derive(Deserialize)]
 struct ChannelPath {
     channel: Option<String>,
@@ -216,54 +223,73 @@ struct ChannelPath {
 
 #[derive(Deserialize)]
 struct ArtifactPath {
-    channel: Option<String>,
     algorithm: String,
     digest: String,
 }
 
 #[derive(Deserialize)]
 struct ReferencePath {
-    channel: Option<String>,
     reference: String,
 }
 
 #[derive(Deserialize)]
 struct KeyPath {
-    channel: Option<String>,
     key: String,
 }
 
 #[derive(Deserialize)]
 struct HashPath {
-    channel: Option<String>,
     hash: String,
 }
 
 pub(super) struct ChannelContext {
     pub channel: ChannelId,
-    pub route_prefix: String,
+    /// Set only when the request came in under an explicit `/channels/{id}` prefix.
+    /// The bare routes resolve to the default channel and carry no prefix.
+    scope: Option<ChannelId>,
     pub access_control: bool,
 }
 
-impl ChannelContext {
-    async fn resolve(
+/// Resolves and authorizes the channel a data request addresses, so every data handler
+/// gets it by taking a `ChannelContext` argument instead of repeating the lookup.
+///
+/// The `{channel}` capture is read through `Path`, which borrows the captured
+/// parameters out of the request extensions rather than taking them, so a handler can
+/// still extract its own `Path<T>` for the rest of the route.
+impl FromRequestParts<Arc<AppState>> for ChannelContext {
+    type Rejection = Response;
+
+    #[allow(clippy::result_large_err)]
+    async fn from_request_parts(
+        parts: &mut Parts,
         state: &Arc<AppState>,
-        channel: Option<&str>,
-        headers: &HeaderMap,
-    ) -> Result<Self, Response> {
+    ) -> Result<Self, Self::Rejection> {
+        let Path(ChannelPath { channel }) = Path::<ChannelPath>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| invalid_channel())?;
         let Some(channel) = channel else {
             return Ok(Self {
                 channel: ChannelId::DEFAULT,
-                route_prefix: String::new(),
+                scope: None,
                 access_control: false,
             });
         };
-        let record = authorize_channel(state, channel, headers).await?;
+        let record = authorize_channel(state, &channel, &parts.headers).await?;
         Ok(Self {
             channel: record.id,
-            route_prefix: format!("/channels/{}", record.id),
+            scope: Some(record.id),
             access_control: record.access.is_protected(),
         })
+    }
+}
+
+impl ChannelContext {
+    /// The path prefix rewritten package URLs must carry to route back to this
+    /// channel. Only the package-proxy handlers rewrite URLs, so it is built on
+    /// demand rather than on every request.
+    pub(super) fn route_prefix(&self) -> String {
+        self.scope
+            .map_or_else(String::new, |channel| format!("/channels/{channel}"))
     }
 }
 
@@ -308,21 +334,23 @@ async fn count_request(
         .headers()
         .get(REQUEST_PURPOSE_HEADER)
         .is_some_and(|value| value.as_bytes() == REQUEST_PURPOSE_PREFETCH.as_bytes());
-    let session = request
-        .headers()
-        .get(REQUEST_SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let configured_concurrency = request
-        .headers()
-        .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
+    // The session and concurrency headers are read only to describe a prefetch, so
+    // foreground traffic never parses them.
     let observation = prefetch.then(|| {
+        let session = request
+            .headers()
+            .get(REQUEST_SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let configured_concurrency = request
+            .headers()
+            .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
         PrefetchObservation::start(
             Arc::clone(&metrics),
-            route.clone(),
-            session.clone(),
+            Some(route.clone()),
+            session,
             configured_concurrency,
         )
     });
@@ -332,7 +360,7 @@ async fn count_request(
     metrics.observe_http_request(
         method.as_str(),
         &route,
-        response.status().as_u16(),
+        response.status(),
         response_headers_duration,
     );
     match observation {
@@ -341,132 +369,26 @@ async fn count_request(
     }
 }
 
-struct PrefetchObservation {
-    metrics: Arc<Metrics>,
-    started: Instant,
-    route: String,
-    session: Option<String>,
-    configured_concurrency: Option<usize>,
-    status: u16,
-    bytes: u64,
-    completed: bool,
-}
-
-impl PrefetchObservation {
-    fn start(
-        metrics: Arc<Metrics>,
-        route: String,
-        session: Option<String>,
-        configured_concurrency: Option<usize>,
-    ) -> Self {
-        let in_flight = metrics.prefetch_started();
-        tracing::debug!(
-            %route,
-            session_id = session.as_deref().unwrap_or(""),
-            configured_concurrency,
-            in_flight,
-            "prefetch request started"
-        );
-        Self {
-            metrics,
-            started: Instant::now(),
-            route,
-            session,
-            configured_concurrency,
-            status: 0,
-            bytes: 0,
-            completed: false,
-        }
-    }
-
-    fn set_status(&mut self, status: u16) {
-        self.status = status;
-        self.metrics.prefetch_response(status);
-    }
-
-    fn add_bytes(&mut self, bytes: usize) {
-        self.bytes = self.bytes.saturating_add(bytes as u64);
-    }
-
-    fn complete(mut self) {
-        self.completed = true;
-    }
-}
-
-impl Drop for PrefetchObservation {
-    fn drop(&mut self) {
-        let duration = self.started.elapsed();
-        self.metrics
-            .prefetch_finished(duration, self.bytes, self.completed);
-        tracing::debug!(
-            route = %self.route,
-            session_id = self.session.as_deref().unwrap_or(""),
-            configured_concurrency = self.configured_concurrency,
-            status = self.status,
-            bytes = self.bytes,
-            duration_ms = duration.as_millis() as u64,
-            completed = self.completed,
-            "prefetch request finished"
-        );
-    }
-}
-
-fn observe_prefetch_body(response: Response, mut observation: PrefetchObservation) -> Response {
-    observation.set_status(response.status().as_u16());
-    let (parts, body) = response.into_parts();
-    let stream = Box::pin(body.into_data_stream());
-    let observed = futures_util::stream::unfold(
-        (stream, Some(observation)),
-        |(mut stream, mut observation)| async move {
-            match stream.next().await {
-                Some(Ok(bytes)) => {
-                    observation
-                        .as_mut()
-                        .expect("prefetch observation exists while streaming")
-                        .add_bytes(bytes.len());
-                    Some((Ok(bytes), (stream, observation)))
-                }
-                Some(Err(error)) => Some((Err(error), (stream, observation))),
-                None => {
-                    observation
-                        .take()
-                        .expect("prefetch observation exists at completion")
-                        .complete();
-                    None
-                }
-            }
-        },
-    );
-    Response::from_parts(parts, Body::from_stream(observed))
-}
-
 async fn put_artifact(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ArtifactPath>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(artifact) = ArtifactId::parse(&path.algorithm, &path.digest) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Some(_permit) = acquire_foreground(&state) else {
         return busy_response();
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let content_length = content_length(&headers);
     match state
         .cache
         .publish(PublishRequest {
             channel: context.channel,
             target: PublicationTarget::ById(artifact),
-            content_type,
+            content_type: content_type(&headers),
             stream: body.into_data_stream(),
             content_length,
             durability: Durability::Durable,
@@ -478,36 +400,17 @@ async fn put_artifact(
             StatusCode::CREATED.into_response()
         }
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(CacheError::Local(crate::storage::local::LocalError::OutOfSpace)) => {
-            state.metrics.raw_pressure_error();
-            insufficient_storage()
-        }
-        Err(CacheError::Local(crate::storage::local::LocalError::DigestMismatch)) => {
-            StatusCode::CONFLICT.into_response()
-        }
-        Err(CacheError::Local(crate::storage::local::LocalError::TooLarge)) => {
-            StatusCode::PAYLOAD_TOO_LARGE.into_response()
-        }
-        Err(CacheError::ChannelDeleting | CacheError::MissingChannel) => {
-            StatusCode::NOT_FOUND.into_response()
-        }
-        Err(error) => {
-            tracing::error!(error = %error, "artifact publication failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Err(error) => cache_write_failure(&state, error),
     }
 }
 
 async fn get_artifact(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ArtifactPath>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(artifact) = ArtifactId::parse(&path.algorithm, &path.digest) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -547,19 +450,18 @@ async fn serve_artifact(
     } else {
         RangeSelection::Full
     };
-    if range == RangeSelection::Unsatisfiable {
-        return Response::builder()
-            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_RANGE, format!("bytes */{content_len}"))
-            .header(header::ETAG, format!("\"{}\"", artifact))
-            .body(Body::empty())
-            .unwrap();
-    }
     let (start, end, length) = match range {
         RangeSelection::Partial { start, end } => (start, end, end - start + 1),
         RangeSelection::Full => (0, content_len.saturating_sub(1), content_len),
-        RangeSelection::Unsatisfiable => unreachable!("handled above"),
+        RangeSelection::Unsatisfiable => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_RANGE, format!("bytes */{content_len}"))
+                .header(header::ETAG, format!("\"{}\"", artifact))
+                .body(Body::empty())
+                .unwrap();
+        }
     };
     // A zstd-stored response is passed through untouched when the client accepts zstd;
     // otherwise it serves the complete logical bytes through the decoder.
@@ -646,13 +548,17 @@ struct ArtifactBinding {
     digest: String,
 }
 
+/// The one data handler that takes its `ChannelContext` as a `Result`: extractors run
+/// before the body, so rejecting here would answer a syntactically broken request with
+/// a channel error. Holding the rejection until the body has parsed keeps a malformed
+/// payload a 400 whatever the channel's access control says.
 async fn put_reference(
     State(state): State<Arc<AppState>>,
+    context: Result<ChannelContext, Response>,
     Path(path): Path<ReferencePath>,
-    headers: HeaderMap,
     Json(binding): Json<ArtifactBinding>,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
+    let context = match context {
         Ok(context) => context,
         Err(response) => return response,
     };
@@ -675,7 +581,7 @@ async fn put_reference(
     };
     match state
         .cache
-        .bind_reference(context.channel, reference.to_string(), artifact)
+        .bind_reference(context.channel, reference.into_string(), artifact)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -697,13 +603,9 @@ async fn put_reference(
 
 async fn get_reference(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ReferencePath>,
-    headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(reference) = Reference::parse(path.reference) else {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -720,7 +622,7 @@ async fn get_reference(
         .await
     {
         Ok(Some(record)) => Json(ArtifactBinding {
-            algorithm: record.artifact.algorithm().to_owned(),
+            algorithm: ArtifactId::ALGORITHM.to_owned(),
             digest: record.artifact.digest().to_string(),
         })
         .into_response(),
@@ -742,13 +644,9 @@ async fn get_reference(
 
 async fn delete_reference(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<ReferencePath>,
-    headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(reference) = Reference::parse(path.reference) else {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -781,7 +679,7 @@ async fn delete_reference(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 enum RangeSelection {
     Full,
     Partial { start: u64, end: u64 },
@@ -984,6 +882,7 @@ async fn delete_channel(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn channel_lease(
     state: &Arc<AppState>,
     channel: &str,
@@ -992,24 +891,16 @@ async fn channel_lease(
     let channel = channel
         .parse::<ChannelId>()
         .map_err(|_| invalid_channel())?;
-    let credential = credential(headers);
-    match state
+    state
         .channels
-        .authorize_with_lease(channel, credential.as_deref())
+        .authorize_with_lease(channel, credential(headers).as_deref())
         .await
-    {
-        Ok(lease) => Ok(lease),
-        Err(error) => {
-            if matches!(error, ChannelError::Unauthorized) {
-                state.metrics.authorization_denial();
-            }
-            Err(channel_failure(error))
-        }
-    }
+        .map_err(|error| channel_denied(state, error))
 }
 
 /// Validates channel credentials and `active` state without taking the lifecycle gate.
 /// Reads remain lock-free, while uploads acquire their deletion fence only at commit.
+#[allow(clippy::result_large_err)]
 async fn authorize_channel(
     state: &Arc<AppState>,
     channel: &str,
@@ -1018,20 +909,20 @@ async fn authorize_channel(
     let channel = channel
         .parse::<ChannelId>()
         .map_err(|_| invalid_channel())?;
-    let credential = credential(headers);
-    match state
+    state
         .channels
-        .authorize(channel, credential.as_deref())
+        .authorize(channel, credential(headers).as_deref())
         .await
-    {
-        Ok(record) => Ok(record),
-        Err(error) => {
-            if matches!(error, ChannelError::Unauthorized) {
-                state.metrics.authorization_denial();
-            }
-            Err(channel_failure(error))
-        }
+        .map_err(|error| channel_denied(state, error))
+}
+
+/// The response for a rejected channel authorization, counting the denials that were
+/// credential failures rather than missing or deleting channels.
+fn channel_denied(state: &Arc<AppState>, error: ChannelError) -> Response {
+    if matches!(error, ChannelError::Unauthorized) {
+        state.metrics.authorization_denial();
     }
+    channel_failure(error)
 }
 
 fn invalid_channel() -> Response {
@@ -1061,7 +952,9 @@ fn credential(headers: &HeaderMap) -> Option<String> {
 
 fn channel_failure(error: ChannelError) -> Response {
     match error {
-        ChannelError::NotFound => api_error(
+        // A channel being deleted is indistinguishable from an absent one to a client:
+        // its data is already unreachable and its id will never be reused.
+        ChannelError::NotFound | ChannelError::Deleting => api_error(
             StatusCode::NOT_FOUND,
             "channel_not_found",
             "channel does not exist",
@@ -1078,11 +971,6 @@ fn channel_failure(error: ChannelError) -> Response {
             );
             response
         }
-        ChannelError::Deleting => api_error(
-            StatusCode::NOT_FOUND,
-            "channel_not_found",
-            "channel does not exist",
-        ),
         ChannelError::DefaultChannel => api_error(
             StatusCode::CONFLICT,
             "default_channel",
@@ -1105,24 +993,17 @@ fn build_reference(kind: &str, key: &str) -> String {
 
 async fn put_http_cache(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<KeyPath>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
-    if Reference::parse(&path.key).is_err() {
+    if !Reference::is_valid(&path.key) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let Some(_permit) = acquire_foreground(&state) else {
         return busy_response();
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let content_length = content_length(&headers);
     match state
         .cache
@@ -1131,7 +1012,7 @@ async fn put_http_cache(
             target: PublicationTarget::ContentAddressed {
                 reference: Some(build_reference("http", &path.key)),
             },
-            content_type,
+            content_type: content_type(&headers),
             stream: body.into_data_stream(),
             content_length,
             durability: Durability::BestEffort,
@@ -1146,14 +1027,11 @@ async fn put_http_cache(
 
 async fn get_http_cache(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<KeyPath>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     serve_reference_artifact(
         state,
         context.channel,
@@ -1192,31 +1070,24 @@ async fn serve_reference_artifact(
 
 async fn put_bazel_cas(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<HashPath>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(artifact) = ArtifactId::parse("sha256", &path.hash) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Some(_permit) = acquire_foreground(&state) else {
         return busy_response();
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let content_length = content_length(&headers);
     match state
         .cache
         .publish(PublishRequest {
             channel: context.channel,
             target: PublicationTarget::ById(artifact),
-            content_type,
+            content_type: content_type(&headers),
             stream: body.into_data_stream(),
             content_length,
             durability: Durability::Durable,
@@ -1225,24 +1096,17 @@ async fn put_bazel_cas(
         .await
     {
         Ok(_) => StatusCode::OK.into_response(),
-        Err(CacheError::Local(crate::storage::local::LocalError::OutOfSpace)) => {
-            state.metrics.raw_pressure_error();
-            insufficient_storage()
-        }
-        Err(error) => cache_write_failure(error),
+        Err(error) => cache_write_failure(&state, error),
     }
 }
 
 async fn get_bazel_cas(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<HashPath>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     let Ok(artifact) = ArtifactId::parse("sha256", &path.hash) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -1258,24 +1122,17 @@ async fn get_bazel_cas(
 
 async fn put_bazel_ac(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<HashPath>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
     if ArtifactId::parse("sha256", &path.hash).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let Some(_permit) = acquire_foreground(&state) else {
         return busy_response();
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let content_length = content_length(&headers);
     match state
         .cache
@@ -1284,7 +1141,7 @@ async fn put_bazel_ac(
             target: PublicationTarget::ContentAddressed {
                 reference: Some(build_reference("bazel-ac", &path.hash)),
             },
-            content_type,
+            content_type: content_type(&headers),
             stream: body.into_data_stream(),
             content_length,
             durability: Durability::BestEffort,
@@ -1299,17 +1156,14 @@ async fn put_bazel_ac(
 
 async fn get_bazel_ac(
     State(state): State<Arc<AppState>>,
+    context: ChannelContext,
     Path(path): Path<HashPath>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let context = match ChannelContext::resolve(&state, path.channel.as_deref(), &headers).await {
-        Ok(context) => context,
-        Err(response) => return response,
-    };
-    if ArtifactId::parse("sha256", &path.hash).is_err() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
+    // No hex validation on the read: an unparseable hash cannot name a stored action
+    // result either, so it takes the same reference lookup and misses, exactly as the
+    // HTTP build-cache read does.
     serve_reference_artifact(
         state,
         context.channel,
@@ -1320,8 +1174,15 @@ async fn get_bazel_ac(
     .await
 }
 
-fn cache_write_failure(error: CacheError) -> Response {
+/// The response for a failed upload. Disk pressure is reported to the client as 507
+/// with a retry hint; the artifact and Bazel CAS routes have no protocol-level way to
+/// say "stored elsewhere", so they cannot bypass the way the build-cache writes do.
+fn cache_write_failure(state: &Arc<AppState>, error: CacheError) -> Response {
     match error {
+        CacheError::Local(crate::storage::local::LocalError::OutOfSpace) => {
+            state.metrics.raw_pressure_error();
+            insufficient_storage()
+        }
         CacheError::Local(crate::storage::local::LocalError::DigestMismatch) => {
             StatusCode::CONFLICT.into_response()
         }
@@ -1332,7 +1193,7 @@ fn cache_write_failure(error: CacheError) -> Response {
             StatusCode::NOT_FOUND.into_response()
         }
         error => {
-            tracing::error!(error = %error, "build-cache write failed");
+            tracing::error!(error = %error, "cache write failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1348,16 +1209,14 @@ fn cache_write_failure_with_bypass(state: &Arc<AppState>, error: CacheError) -> 
         state.metrics.build_cache_bypass();
         return StatusCode::OK.into_response();
     }
-    cache_write_failure(error)
+    cache_write_failure(state, error)
 }
 
-fn content_length(headers: &HeaderMap) -> Option<u64> {
+fn content_type(headers: &HeaderMap) -> Option<String> {
     headers
-        .get(header::CONTENT_LENGTH)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 fn insufficient_storage() -> Response {

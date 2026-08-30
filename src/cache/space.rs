@@ -49,6 +49,14 @@ pub enum Mode {
     Reclaiming,
 }
 
+/// One consistent reading of the ledger's exported counters.
+#[derive(Clone, Copy, Debug)]
+pub struct SpaceSnapshot {
+    pub free_observed: u64,
+    pub reserved: u64,
+    pub committed_since: u64,
+}
+
 /// The mutable ledger state guarded by a single mutex. Guarding the snapshot as one
 /// unit keeps a `refresh` from erasing bytes committed after its filesystem sample and
 /// keeps `degraded` observation handling consistent with reservation accounting. The
@@ -78,22 +86,22 @@ pub struct SpaceLedger {
 }
 
 impl SpaceLedger {
+    /// Starts degraded with no observation, then takes the first one through `refresh`
+    /// so a ledger whose very first `statvfs` fails stays degraded and admits nothing.
     pub fn new(source: Arc<dyn FreeSpace>, policy: SpacePolicy) -> Self {
-        let (free_observed, degraded) = match source.free_bytes() {
-            Some(free) => (free, false),
-            None => (0, true),
-        };
-        Self {
+        let ledger = Self {
             source,
             policy,
             state: Mutex::new(State {
-                free_observed,
+                free_observed: 0,
                 reserved: 0,
                 committed_since: 0,
-                degraded,
+                degraded: true,
                 reclaiming: false,
             }),
-        }
+        };
+        ledger.refresh();
+        ledger
     }
 
     /// Re-observes filesystem free space and resets the committed-since counter, since
@@ -125,13 +133,6 @@ impl SpaceLedger {
         state.free_observed.saturating_sub(spoken_for)
     }
 
-    /// Bytes available for new staging reservations after subtracting outstanding
-    /// reservations, bytes committed since the last observation, and headroom.
-    pub fn available(&self) -> u64 {
-        let state = self.state.lock().expect("space ledger poisoned");
-        self.available_locked(&state)
-    }
-
     /// The current maintenance mode using low/high watermark hysteresis.
     pub fn mode(&self) -> Mode {
         let mut state = self.state.lock().expect("space ledger poisoned");
@@ -157,22 +158,15 @@ impl SpaceLedger {
         self.state.lock().expect("space ledger poisoned").degraded
     }
 
-    pub fn free_observed(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("space ledger poisoned")
-            .free_observed
-    }
-
-    pub fn reserved(&self) -> u64 {
-        self.state.lock().expect("space ledger poisoned").reserved
-    }
-
-    pub fn committed_since(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("space ledger poisoned")
-            .committed_since
+    /// The three published counters read together, so the exported gauges describe one
+    /// consistent ledger state instead of three independently locked samples.
+    pub fn snapshot(&self) -> SpaceSnapshot {
+        let state = self.state.lock().expect("space ledger poisoned");
+        SpaceSnapshot {
+            free_observed: state.free_observed,
+            reserved: state.reserved,
+            committed_since: state.committed_since,
+        }
     }
 }
 

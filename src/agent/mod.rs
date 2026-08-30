@@ -22,7 +22,10 @@ use crate::{
         REQUEST_PREFETCH_CONCURRENCY_HEADER, REQUEST_PURPOSE_HEADER, REQUEST_PURPOSE_PREFETCH,
         REQUEST_SESSION_HEADER,
     },
-    telemetry::{MakeRequestUlid, REQUEST_ID_HEADER},
+    telemetry::{
+        MakeRequestUlid, PrefetchObservation, PrefetchRecorder, REQUEST_ID_HEADER, encode_registry,
+        histogram, int_counter, int_gauge, observe_prefetch_body, saturating_i64, transfer_buckets,
+    },
 };
 use axum::{
     Json, Router,
@@ -33,11 +36,7 @@ use axum::{
     routing::get,
 };
 use discovery::{Resolver, RingState, RingStatus};
-use futures_util::StreamExt;
-use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry, TextEncoder,
-    core::Collector,
-};
+use prometheus::{Histogram, IntCounter, IntGauge, Registry};
 use ring::RingMember;
 use serde::Serialize;
 use std::{
@@ -83,7 +82,7 @@ struct AgentState {
     ring: RingState,
     resolver: Arc<dyn Resolver>,
     client: reqwest::Client,
-    metrics: AgentMetrics,
+    metrics: Arc<AgentMetrics>,
 }
 
 impl Agent {
@@ -114,7 +113,7 @@ impl Agent {
                 ring,
                 resolver,
                 client,
-                metrics: AgentMetrics::new()?,
+                metrics: Arc::new(AgentMetrics::new()?),
             }),
         })
     }
@@ -255,27 +254,29 @@ struct RoutedKey {
 }
 
 fn agent_request_span(request: &Request) -> tracing::Span {
-    let (operation, key, class) = match request.extensions().get::<MatchedPath>() {
-        Some(path) => (path.as_str().to_owned(), String::new(), "control"),
-        None => {
-            let routed = classify(request.method(), request.uri().path());
-            (routed.kind, routed.id, routed.class.as_str())
-        }
-    };
     let request_id = request
         .headers()
         .get(&REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("invalid");
-    tracing::info_span!(
+    let span = tracing::info_span!(
         "http_request",
         component = "agent",
         %request_id,
         method = %request.method(),
-        %operation,
-        %key,
-        class,
-    )
+        operation = tracing::field::Empty,
+        key = tracing::field::Empty,
+        class = tracing::field::Empty,
+    );
+    // A control route is identified by its matched path; every other request is
+    // classified once by the forwarder, which records these fields itself rather
+    // than making the span repeat the work.
+    if let Some(path) = request.extensions().get::<MatchedPath>() {
+        span.record("operation", path.as_str());
+        span.record("key", "");
+        span.record("class", "control");
+    }
+    span
 }
 
 /// Derives the routing object from a bare default-channel request path, mirroring the
@@ -332,18 +333,25 @@ async fn forward(State(state): State<Arc<AgentState>>, request: Request) -> Resp
         .headers()
         .get(REQUEST_PURPOSE_HEADER)
         .is_some_and(|value| value.as_bytes() == REQUEST_PURPOSE_PREFETCH.as_bytes());
-    let session = request
-        .headers()
-        .get(REQUEST_SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let configured_concurrency = request
-        .headers()
-        .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
+    // The session and concurrency headers are read only to describe a prefetch, so
+    // foreground traffic never parses them.
     let observation = prefetch.then(|| {
-        AgentPrefetchObservation::start(Arc::clone(&state), session, configured_concurrency)
+        let session = request
+            .headers()
+            .get(REQUEST_SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let configured_concurrency = request
+            .headers()
+            .get(REQUEST_PREFETCH_CONCURRENCY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
+        PrefetchObservation::start(
+            Arc::clone(&state.metrics),
+            None,
+            session,
+            configured_concurrency,
+        )
     });
     let started = Instant::now();
     let response = forward_request(&state, request, prefetch).await;
@@ -358,14 +366,19 @@ async fn forward(State(state): State<Arc<AgentState>>, request: Request) -> Resp
 }
 
 async fn forward_request(state: &Arc<AgentState>, request: Request, prefetch: bool) -> Response {
+    let routed = classify(request.method(), request.uri().path());
+    let span = tracing::Span::current();
+    span.record("operation", routed.kind.as_str());
+    span.record("key", routed.id.as_str());
+    span.record("class", routed.class.as_str());
     if request.uri().path() == "/channels" || request.uri().path().starts_with("/channels/") {
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
-    let routed = classify(request.method(), request.uri().path());
     let Some(position) = ring::key_position(&routed.kind, &routed.id) else {
         return StatusCode::URI_TOO_LONG.into_response();
     };
-    let Some(owner) = state.ring.ring().owner(position).cloned() else {
+    let ring = state.ring.ring();
+    let Some(owner) = ring.owner(position) else {
         if prefetch {
             state.metrics.prefetch_unavailable.inc();
         }
@@ -376,17 +389,17 @@ async fn forward_request(state: &Arc<AgentState>, request: Request, prefetch: bo
         .path_and_query()
         .map_or("/", |path_and_query| path_and_query.as_str());
     let url = format!("http://{}{}", owner.address, path_and_query);
-    let method = request.method().clone();
-    let reqwest_method =
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).expect("method round-trips");
     let (parts, body) = request.into_parts();
-    let mut upstream = state.client.request(reqwest_method, url);
+    // Axum and reqwest share one `http` crate, so the inbound method is the outbound
+    // method — no textual round-trip.
+    let bodyless = matches!(parts.method, Method::GET | Method::HEAD);
+    let mut upstream = state.client.request(parts.method, url);
     for (name, value) in &parts.headers {
         if !skip_request_header(name.as_str()) {
             upstream = upstream.header(name.as_str(), value.as_bytes());
         }
     }
-    if !matches!(method, Method::GET | Method::HEAD) {
+    if !bodyless {
         upstream = upstream.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     }
     match upstream.send().await {
@@ -408,123 +421,13 @@ async fn forward_request(state: &Arc<AgentState>, request: Request, prefetch: bo
         }
         Err(error) => {
             tracing::warn!(%error, owner = owner.id, "forwarded request failed");
-            record_send_failure(state, &owner, &error);
+            record_send_failure(state, owner, &error);
             if prefetch {
                 state.metrics.prefetch_unavailable.inc();
             }
             degrade(state, routed.class, false)
         }
     }
-}
-
-struct AgentPrefetchObservation {
-    state: Arc<AgentState>,
-    started: Instant,
-    session: Option<String>,
-    configured_concurrency: Option<usize>,
-    status: u16,
-    bytes: u64,
-    completed: bool,
-}
-
-impl AgentPrefetchObservation {
-    fn start(
-        state: Arc<AgentState>,
-        session: Option<String>,
-        configured_concurrency: Option<usize>,
-    ) -> Self {
-        state.metrics.prefetch_requests.inc();
-        state.metrics.prefetch_in_flight.inc();
-        let in_flight = state.metrics.prefetch_in_flight.get();
-        tracing::debug!(
-            session_id = session.as_deref().unwrap_or(""),
-            configured_concurrency,
-            in_flight,
-            "agent prefetch request started"
-        );
-        Self {
-            state,
-            started: Instant::now(),
-            session,
-            configured_concurrency,
-            status: 0,
-            bytes: 0,
-            completed: false,
-        }
-    }
-
-    fn set_status(&mut self, status: u16) {
-        self.status = status;
-    }
-
-    fn add_bytes(&mut self, bytes: usize) {
-        self.bytes = self.bytes.saturating_add(bytes as u64);
-    }
-
-    fn complete(mut self) {
-        self.completed = true;
-    }
-}
-
-impl Drop for AgentPrefetchObservation {
-    fn drop(&mut self) {
-        let duration = self.started.elapsed();
-        self.state.metrics.prefetch_in_flight.dec();
-        self.state
-            .metrics
-            .prefetch_response_bytes
-            .inc_by(self.bytes);
-        self.state
-            .metrics
-            .prefetch_transfer_duration
-            .observe(duration.as_secs_f64());
-        if self.completed {
-            self.state.metrics.prefetch_completed.inc();
-        } else {
-            self.state.metrics.prefetch_cancelled.inc();
-        }
-        tracing::debug!(
-            session_id = self.session.as_deref().unwrap_or(""),
-            configured_concurrency = self.configured_concurrency,
-            status = self.status,
-            bytes = self.bytes,
-            duration_ms = duration.as_millis() as u64,
-            completed = self.completed,
-            "agent prefetch request finished"
-        );
-    }
-}
-
-fn observe_prefetch_body(
-    response: Response,
-    mut observation: AgentPrefetchObservation,
-) -> Response {
-    observation.set_status(response.status().as_u16());
-    let (parts, body) = response.into_parts();
-    let stream = Box::pin(body.into_data_stream());
-    let observed = futures_util::stream::unfold(
-        (stream, Some(observation)),
-        |(mut stream, mut observation)| async move {
-            match stream.next().await {
-                Some(Ok(bytes)) => {
-                    observation
-                        .as_mut()
-                        .expect("prefetch observation exists while streaming")
-                        .add_bytes(bytes.len());
-                    Some((Ok(bytes), (stream, observation)))
-                }
-                Some(Err(error)) => Some((Err(error), (stream, observation))),
-                None => {
-                    observation
-                        .take()
-                        .expect("prefetch observation exists at completion")
-                        .complete();
-                    None
-                }
-            }
-        },
-    );
-    Response::from_parts(parts, Body::from_stream(observed))
 }
 
 /// Counts a failure toward ejection only when it is attributable to the backend
@@ -668,183 +571,142 @@ struct AgentMetrics {
 impl AgentMetrics {
     fn new() -> prometheus::Result<Self> {
         let registry = Registry::new();
-        let requests = agent_counter(
-            &registry,
-            "requests_total",
-            "Requests received by the routing agent.",
-        )?;
-        let forwarded = agent_counter(
-            &registry,
-            "forwarded_total",
-            "Requests forwarded to a shard.",
-        )?;
-        let forward_duration = agent_histogram(
-            &registry,
-            "forward_duration_seconds",
-            "Time from agent request receipt until response headers are ready.",
-            request_buckets(),
-        )?;
-        let forward_failures = agent_counter(
-            &registry,
-            "forward_failures_total",
-            "Shard connection failures and send timeouts.",
-        )?;
-        let synthesized_misses = agent_counter(
-            &registry,
-            "synthesized_misses_total",
-            "Build-cache misses synthesized without a shard response.",
-        )?;
-        let synthesized_bypasses = agent_counter(
-            &registry,
-            "synthesized_write_bypasses_total",
-            "Build-cache write successes synthesized without storing the body.",
-        )?;
-        let unavailable = agent_counter(
-            &registry,
-            "unavailable_total",
-            "Non-build-cache requests that could not reach an owner.",
-        )?;
-        let ejections = agent_counter(
-            &registry,
-            "ejections_total",
-            "Shard ejections from the routing ring.",
-        )?;
-        let prefetch_requests = agent_counter(
-            &registry,
-            "prefetch_requests_total",
-            "Prefetch requests received by the routing agent.",
-        )?;
-        let prefetch_hits = agent_counter(
-            &registry,
-            "prefetch_hits_total",
-            "Prefetch requests answered successfully by a shard.",
-        )?;
-        let prefetch_misses = agent_counter(
-            &registry,
-            "prefetch_misses_total",
-            "Prefetch requests answered with a cache miss.",
-        )?;
-        let prefetch_unavailable = agent_counter(
-            &registry,
-            "prefetch_unavailable_total",
-            "Prefetch requests unavailable because no shard produced a cache response.",
-        )?;
-        let prefetch_response_bytes = agent_counter(
-            &registry,
-            "prefetch_response_bytes_total",
-            "Prefetch response bytes actually streamed through the agent.",
-        )?;
-        let prefetch_in_flight = agent_gauge(
-            &registry,
-            "prefetch_in_flight",
-            "Prefetch response bodies currently streaming through the agent.",
-        )?;
-        let prefetch_completed = agent_counter(
-            &registry,
-            "prefetch_completed_total",
-            "Prefetch response bodies streamed to completion.",
-        )?;
-        let prefetch_cancelled = agent_counter(
-            &registry,
-            "prefetch_cancelled_total",
-            "Prefetch response bodies dropped before completion.",
-        )?;
-        let prefetch_transfer_duration = agent_histogram(
-            &registry,
-            "prefetch_transfer_duration_seconds",
-            "Prefetch response body lifetime through the agent.",
-            transfer_buckets(),
-        )?;
-        let ring_members = agent_gauge(
-            &registry,
-            "ring_members",
-            "Members in the current routing ring.",
-        )?;
-        let ring_ejected = agent_gauge(
-            &registry,
-            "ring_ejected",
-            "Members currently ejected from the routing ring.",
-        )?;
-
         Ok(Self {
+            requests: int_counter(
+                &registry,
+                "flywheel_agent_requests_total",
+                "Requests received by the routing agent.",
+            )?,
+            forwarded: int_counter(
+                &registry,
+                "flywheel_agent_forwarded_total",
+                "Requests forwarded to a shard.",
+            )?,
+            forward_duration: histogram(
+                &registry,
+                "flywheel_agent_forward_duration_seconds",
+                "Time from agent request receipt until response headers are ready.",
+                request_buckets(),
+            )?,
+            forward_failures: int_counter(
+                &registry,
+                "flywheel_agent_forward_failures_total",
+                "Shard connection failures and send timeouts.",
+            )?,
+            synthesized_misses: int_counter(
+                &registry,
+                "flywheel_agent_synthesized_misses_total",
+                "Build-cache misses synthesized without a shard response.",
+            )?,
+            synthesized_bypasses: int_counter(
+                &registry,
+                "flywheel_agent_synthesized_write_bypasses_total",
+                "Build-cache write successes synthesized without storing the body.",
+            )?,
+            unavailable: int_counter(
+                &registry,
+                "flywheel_agent_unavailable_total",
+                "Non-build-cache requests that could not reach an owner.",
+            )?,
+            ejections: int_counter(
+                &registry,
+                "flywheel_agent_ejections_total",
+                "Shard ejections from the routing ring.",
+            )?,
+            prefetch_requests: int_counter(
+                &registry,
+                "flywheel_agent_prefetch_requests_total",
+                "Prefetch requests received by the routing agent.",
+            )?,
+            prefetch_hits: int_counter(
+                &registry,
+                "flywheel_agent_prefetch_hits_total",
+                "Prefetch requests answered successfully by a shard.",
+            )?,
+            prefetch_misses: int_counter(
+                &registry,
+                "flywheel_agent_prefetch_misses_total",
+                "Prefetch requests answered with a cache miss.",
+            )?,
+            prefetch_unavailable: int_counter(
+                &registry,
+                "flywheel_agent_prefetch_unavailable_total",
+                "Prefetch requests unavailable because no shard produced a cache response.",
+            )?,
+            prefetch_response_bytes: int_counter(
+                &registry,
+                "flywheel_agent_prefetch_response_bytes_total",
+                "Prefetch response bytes actually streamed through the agent.",
+            )?,
+            prefetch_in_flight: int_gauge(
+                &registry,
+                "flywheel_agent_prefetch_in_flight",
+                "Prefetch response bodies currently streaming through the agent.",
+            )?,
+            prefetch_completed: int_counter(
+                &registry,
+                "flywheel_agent_prefetch_completed_total",
+                "Prefetch response bodies streamed to completion.",
+            )?,
+            prefetch_cancelled: int_counter(
+                &registry,
+                "flywheel_agent_prefetch_cancelled_total",
+                "Prefetch response bodies dropped before completion.",
+            )?,
+            prefetch_transfer_duration: histogram(
+                &registry,
+                "flywheel_agent_prefetch_transfer_duration_seconds",
+                "Prefetch response body lifetime through the agent.",
+                transfer_buckets(),
+            )?,
+            ring_members: int_gauge(
+                &registry,
+                "flywheel_agent_ring_members",
+                "Members in the current routing ring.",
+            )?,
+            ring_ejected: int_gauge(
+                &registry,
+                "flywheel_agent_ring_ejected",
+                "Members currently ejected from the routing ring.",
+            )?,
             registry,
-            requests,
-            forwarded,
-            forward_duration,
-            forward_failures,
-            synthesized_misses,
-            synthesized_bypasses,
-            unavailable,
-            ejections,
-            prefetch_requests,
-            prefetch_hits,
-            prefetch_misses,
-            prefetch_unavailable,
-            prefetch_response_bytes,
-            prefetch_in_flight,
-            prefetch_completed,
-            prefetch_cancelled,
-            prefetch_transfer_duration,
-            ring_members,
-            ring_ejected,
         })
     }
 
     fn encode(&self, members: usize, ejected: usize) -> prometheus::Result<Vec<u8>> {
-        self.ring_members.set(saturating_i64(members));
-        self.ring_ejected.set(saturating_i64(ejected));
-        let mut body = Vec::new();
-        TextEncoder::new().encode(&self.registry.gather(), &mut body)?;
-        Ok(body)
+        self.ring_members.set(saturating_i64(members as u64));
+        self.ring_ejected.set(saturating_i64(ejected as u64));
+        encode_registry(&self.registry)
     }
 }
 
-fn agent_register<T>(registry: &Registry, metric: T) -> prometheus::Result<T>
-where
-    T: Collector + Clone + 'static,
-{
-    registry.register(Box::new(metric.clone()))?;
-    Ok(metric)
-}
+impl PrefetchRecorder for AgentMetrics {
+    fn prefetch_started(&self) -> i64 {
+        self.prefetch_requests.inc();
+        self.prefetch_in_flight.inc();
+        self.prefetch_in_flight.get()
+    }
 
-fn agent_counter(registry: &Registry, suffix: &str, help: &str) -> prometheus::Result<IntCounter> {
-    agent_register(
-        registry,
-        IntCounter::with_opts(Opts::new(format!("flywheel_agent_{suffix}"), help))?,
-    )
-}
+    /// The agent classifies a prefetch where it learns the outcome — a forwarded
+    /// response, an empty ring, or a send failure — so there is nothing left to
+    /// record once the body is on its way back.
+    fn prefetch_response(&self, _status: u16) {}
 
-fn agent_gauge(registry: &Registry, suffix: &str, help: &str) -> prometheus::Result<IntGauge> {
-    agent_register(
-        registry,
-        IntGauge::with_opts(Opts::new(format!("flywheel_agent_{suffix}"), help))?,
-    )
-}
-
-fn agent_histogram(
-    registry: &Registry,
-    suffix: &str,
-    help: &str,
-    buckets: Vec<f64>,
-) -> prometheus::Result<Histogram> {
-    agent_register(
-        registry,
-        Histogram::with_opts(
-            HistogramOpts::new(format!("flywheel_agent_{suffix}"), help).buckets(buckets),
-        )?,
-    )
+    fn prefetch_finished(&self, duration: Duration, bytes: u64, completed: bool) {
+        self.prefetch_in_flight.dec();
+        self.prefetch_response_bytes.inc_by(bytes);
+        self.prefetch_transfer_duration
+            .observe(duration.as_secs_f64());
+        if completed {
+            self.prefetch_completed.inc();
+        } else {
+            self.prefetch_cancelled.inc();
+        }
+    }
 }
 
 fn request_buckets() -> Vec<f64> {
     vec![
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
     ]
-}
-
-fn transfer_buckets() -> Vec<f64> {
-    vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]
-}
-
-fn saturating_i64(value: usize) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
 }

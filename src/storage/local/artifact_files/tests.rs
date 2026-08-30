@@ -201,6 +201,41 @@ async fn cancelling_staging_schedules_cleanup_and_reuses_capacity() {
     assert!(matches!(retry, StageOutcome::Ready(_)));
 }
 
+/// A zero-length body reserves nothing, but staging still creates its `.part`
+/// file. Dropping the stage has to remove that file: cleanup keys off the
+/// filesystem state, not off the reserved byte count.
+#[tokio::test]
+async fn dropping_a_zero_length_stage_removes_its_temporary_file() {
+    let directory = TempDir::new().unwrap();
+    let files = ArtifactFiles::open(directory.path(), 4).await.unwrap();
+    let accounting = Arc::new(Accounting::new(4));
+    let outcome = files
+        .stage(
+            ChannelId::DEFAULT,
+            body([]),
+            4,
+            Some(0),
+            accounting.clone(),
+            Durability::BestEffort,
+            StoredEncoding::Identity,
+        )
+        .await
+        .unwrap();
+    let StageOutcome::Ready(staged) = outcome else {
+        panic!("an empty body always fits");
+    };
+    assert_eq!(staged.len, 0);
+    assert_eq!(temporary_file_count(directory.path()), 1);
+
+    drop(staged);
+
+    accounting
+        .wait_for(|| temporary_file_count(directory.path()) == 0)
+        .await;
+    assert_eq!(accounting.reserved(), 0);
+    assert_eq!(accounting.committed(), 0);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn failed_deletion_conservatively_commits_capacity() {
