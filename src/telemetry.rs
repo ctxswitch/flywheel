@@ -371,6 +371,12 @@ impl<R: PrefetchRecorder> PrefetchObservation<R> {
     fn add_bytes(&mut self, bytes: usize) {
         self.bytes = self.bytes.saturating_add(bytes as u64);
     }
+
+    /// Records successful exhaustion without triggering `unused_assignments` in the
+    /// stream's terminal arm; `Drop` observes the completed state.
+    fn complete(&mut self) {
+        self.completed = true;
+    }
 }
 
 impl<R: PrefetchRecorder> Drop for PrefetchObservation<R> {
@@ -414,7 +420,7 @@ where
                 }
                 Some(Err(error)) => Some((Err(error), (stream, observation))),
                 None => {
-                    observation.completed = true;
+                    observation.complete();
                     None
                 }
             }
