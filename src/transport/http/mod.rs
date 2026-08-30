@@ -246,6 +246,7 @@ pub(super) struct ChannelContext {
 }
 
 impl ChannelContext {
+    #[allow(clippy::result_large_err)]
     async fn resolve(
         state: &Arc<AppState>,
         channel: Option<&str>,
@@ -984,6 +985,7 @@ async fn delete_channel(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn channel_lease(
     state: &Arc<AppState>,
     channel: &str,
@@ -1010,6 +1012,7 @@ async fn channel_lease(
 
 /// Validates channel credentials and `active` state without taking the lifecycle gate.
 /// Reads remain lock-free, while uploads acquire their deletion fence only at commit.
+#[allow(clippy::result_large_err)]
 async fn authorize_channel(
     state: &Arc<AppState>,
     channel: &str,
