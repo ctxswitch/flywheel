@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch: {}
+
+concurrency: 10
+
+env:
+  CARGO_TERM_COLOR: always
+
+agents:
+  queue: default
+
+actions:
+  - group: Static checks
+    actions:
+      - label: Format
+        key: fmt
+        image: rust:1.94-bookworm
+        command: |
+          set -eu
+          rustup component add rustfmt
+          cargo fmt --check
+
+      - label: Clippy
+        key: clippy
+        image: rust:1.94-bookworm
+        timeout: 30m
+        command: |
+          set -eu
+          apt-get update
+          apt-get install --yes --no-install-recommends libclang-dev
+          rm -rf /var/lib/apt/lists/*
+          rustup component add clippy
+          cargo clippy --all-targets --all-features -- -D warnings
+
+  - group: Test, coverage, and build
+    actions:
+      - label: Test
+        key: test
+        image: rust:1.94-bookworm
+        timeout: 40m
+        command: |
+          set -eu
+          apt-get update
+          apt-get install --yes --no-install-recommends libclang-dev
+          rm -rf /var/lib/apt/lists/*
+          cargo test --all-targets
+
+      - label: Coverage
+        key: coverage
+        image: rust:1.94-bookworm
+        depends_on: [test]
+        timeout: 60m
+        secrets:
+          CODECOV_TOKEN: enactr://CODECOV_TOKEN
+        command: |
+          set -eu
+
+          apt-get update
+          apt-get install --yes --no-install-recommends curl libclang-dev
+          rm -rf /var/lib/apt/lists/*
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --locked
+          cargo llvm-cov --all-targets --lcov --output-path lcov.info
+
+          curl -Os https://cli.codecov.io/latest/linux/codecov
+          chmod +x codecov
+          ./codecov --verbose upload-process \
+            --disable-search \
+            --fail-on-error \
+            --token "$CODECOV_TOKEN" \
+            --name "enactr-${ENACTR_RUN_ID}" \
+            --file lcov.info
+
+      - label: Release build
+        key: build
+        image: rust:1.94-bookworm
+        timeout: 40m
+        command: |
+          set -eu
+          apt-get update
+          apt-get install --yes --no-install-recommends libclang-dev
+          rm -rf /var/lib/apt/lists/*
+          cargo build --release
